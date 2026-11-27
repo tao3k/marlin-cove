@@ -1,40 +1,37 @@
+# SPDX-FileCopyrightText: 2026 tao3k team and Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
+
 set dotenv-load := true
 
 fmt:
     cargo fmt --check
 
 test:
-    cargo test
+    cargo test --all-features
+
+test-feature-matrix:
+    cargo test --no-default-features
+    cargo test --no-default-features --features telegram
+    cargo test --no-default-features --features discord
+    cargo test --no-default-features --features relay
+    cargo test --no-default-features --features relay,telegram
+    cargo test --no-default-features --features relay,discord
+    cargo test --all-features
 
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
 
-test-channel-harness:
-    cargo test --test unit_test harness:: -- --nocapture
-
-test-channel-contract:
-    cargo test --test unit_test channels:: -- --nocapture
-    cargo test --test unit_test session:: -- --nocapture
-    cargo test --test unit_test runtime:: -- --nocapture
-    cargo test --test unit_test turn:: -- --nocapture
-    cargo test --test unit_test harness:: -- --nocapture
+check-config:
+    cargo run -- check-config
 
 preflight:
     cargo run -- preflight
 
-preflight-script:
-    bash scripts/channel/preflight.sh
-
 plan-live:
     cargo run -- plan-live
 
-plan-live-script:
-    bash scripts/channel/plan-live.sh
+serve:
+    cargo run -- serve
 
-stage-m4b:
-    bash scripts/channel/stage-m4b.sh
-
-check:
-    cargo fmt --check
-    cargo test
-    cargo clippy --all-targets -- -D warnings
+check: fmt test-feature-matrix clippy

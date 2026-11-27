@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 tao3k team and Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
+
+[relay]
+state = "enabled"
+bind_addr = "127.0.0.1:18090"
+# auth_token = "replace-with-cove-bearer-token"
+max_bot_chain_depth = 2
+
+[marlin_gateway]
+base_url = "http://127.0.0.1:18093"
+# bearer_token = "replace-with-marlin-gateway-token"
+
+[telegram]
+state = "disabled"
+# bot_token = "123456:ABC..."
+# webhook_secret = "replace-with-telegram-secret"
+webhook_path = "/v1/bridges/telegram/webhook"
+api_base_url = "https://api.telegram.org"
+session_partition = "chat"
+default_room_id = "cove-main"
+
+[discord]
+state = "disabled"
+# bot_token = "replace-with-discord-bot-token"
+# bot_user_id = "123456789012345678"
+# ingress_secret = "replace-with-discord-ingress-secret"
+ingress_path = "/v1/bridges/discord/ingress"
+api_base_url = "https://discord.com/api/v10"
+mention_policy = "required"
+session_partition = "guild_channel_user"
+default_room_id = "cove-main"
+
+[governance]
+default_guest_scope = "public"
+scheme_policy_entry = "scheme/governance/interface.ss"

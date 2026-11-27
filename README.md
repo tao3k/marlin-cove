@@ -1,146 +1,101 @@
-# lingchong-bot
+<!--
+SPDX-FileCopyrightText: 2026 tao3k team and Contributors
 
-`lingchong-bot` owns the Telegram and Discord bot runtime surface that is being
-split out of `xiuxian-artisan-workshop`.
+SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
+-->
 
-## Ownership
+# Marlin Cove (`marlin-cove`)
 
-This repository owns:
+**Marlin Cove** is the cloud room relay, modular Telegram/Discord bot bridge,
+and high-order room/people/bot governance service for Marlin's AI-native
+collaboration rooms.
 
-- Telegram and Discord bot adapters.
-- Channel-safe message formatting and chunking.
-- Gateway/client calls to an external agent service.
-- Channel turn mapping from inbound bot messages to gateway `/message` calls.
-- Bot runtime configuration and deployment documentation.
-- Bot-specific mock and live-gated tests.
-- Deterministic channel harness helpers for parser/config validation.
+## Clean Architectural Separation
 
-This repository does not own:
+1. **User Configuration & Deployment (`TOML`)**:
+   Typed `cove.toml` envelopes (`CoveConfig`) with `MARLIN_COVE_*` environment
+   overlays govern all user-facing settings (relay bind address, Marlin Gateway
+   endpoint, Telegram/Discord bridge toggles & secrets).
+2. **Marlin Cove Governance Plane (`scheme/` + Rust typed boundary)**:
+   - `scheme/gerbil.pkg` imports `agentic-ai-lab` using the exact same Yuanxu +
+     POO convention as `marlin-agent-core/scheme`.
+   - `scheme/governance/` owns high-order policy combinators (`compose-policies`,
+     `when-role`, `when-bridge`, `require-human-principal`) for room membership,
+     scoped invites, external bot admission, bot-loop ceilings, and human-only
+     Tier-0 PromptGate approvals.
+   - Rust owns typed domain newtypes, receipts, Axum HTTP/SSE relay transport,
+     and bridge webhooks.
+3. **Marlin Gateway (`marlin-agent-core`)**:
+   - `.org` context storage and atomic context projection (`org-scope`) belong
+     exclusively to `marlin-agent-core`.
+   - `marlin-cove` forwards a verified `RoomGovernanceEnvelope` (`room_id`,
+     `actor_id`, `actor_role`, `granted_scopes`, `origin`, `tainted_external`)
+     to **Marlin Gateway**, letting Agent A / Agent B enforce their own `.org`
+     context boundaries without duplicating context storage in Cove.
 
-- Wendao search, indexing, or knowledge-domain algorithms.
-- Qianji workflow execution.
-- Zhixing tools.
-- Daochang native-tool registries or skill aliases.
+## Modular Cargo Features
 
-Bot-to-Wendao integration must use explicit gateway or client boundaries. Native
-tools stay in the Xiuxian kernel/domain side or move to a separate service
-contract later.
+| Feature | Purpose |
+| --- | --- |
+| `relay` | Axum HTTP + SSE Cloud Room Relay (`/v1/rooms`, `/v1/invites`, `/v1/rooms/{id}/events`, `/v1/rooms/{id}/governance/{principal_id}`, Human-Only Tier-0 PromptGates) |
+| `telegram` | Telegram Bot API webhook ingress, Markdown AST-aware 4096-char chunking (`pulldown-cmark`), outbound Bot API sender, group profile & session partition helpers |
+| `discord` | Discord ingress adapter, mention gate, 2000-char chunking, outbound REST sender, and ACL validation helpers |
+| `full` / `default` | Enables `relay`, `telegram`, and `discord` |
 
-## Development
-
-```shell
-direnv exec . cargo fmt --check
-direnv exec . cargo test
-direnv exec . cargo clippy --all-targets -- -D warnings
-direnv exec . just test-channel-harness
-direnv exec . just test-channel-contract
-direnv exec . just stage-m4b
-```
-
-`cargo test` includes the repository's self-applied
-`rust-lang-project-harness` policy gate. The harness dependency is pinned in
-`Cargo.toml` because this repository is expected to follow the same Rust project
-maintenance contract as the Xiuxian crates it was split from.
-
-## Channel Harness
-
-The first migrated harness slice is implemented as typed Rust helpers under
-`src/harness/`, not as a bulk import of legacy Python scripts. It currently
-covers:
-
-- Telegram group-profile extraction from runtime logs.
-- Telegram session-matrix key/scope planning and admin group selection.
-- Discord ingress stress configuration normalization.
-- Discord ACL command-reply and JSON session-scope validation.
-
-This keeps the target repo aligned with its channel ownership while avoiding
-old in-process Daochang/native-tool coupling.
-
-The dedicated harness entrypoint is:
+Compile only what your deployment needs:
 
 ```shell
-direnv exec . just test-channel-harness
+# Minimal protocol + typed TOML config + Marlin Gateway client
+cargo build --no-default-features
+
+# Cloud Cove Relay only (no external chat bots)
+cargo build --no-default-features --features relay
+
+# Cloud Cove Relay + Telegram bot bridge only
+cargo build --no-default-features --features relay,telegram
+
+# Full Marlin Cove deployment
+cargo build --all-features
 ```
 
-The stage-level channel contract entrypoint is:
+## Quick Start
 
 ```shell
-direnv exec . just test-channel-contract
+# Inspect compiled features & secret-safe configuration
+cargo run -- features
+cargo run -- check-config --config cove.example.toml
+cargo run -- preflight --config cove.example.toml
+
+# Run the live Cloud Cove Relay + enabled bot webhooks
+cargo run -- serve --config cove.example.toml
 ```
 
-## Runtime Configuration
+## HTTP / SSE Relay Contract (for `marlin-ui` & Marlin Gateway)
 
-The first executable surface is a configuration check:
+- `GET /v1/health` — liveness + compiled Cargo features
+- `GET /v1/rooms` / `POST /v1/rooms` — list or create Cove rooms
+- `GET /v1/rooms/{room_id}/snapshot` — full room snapshot (channels, humans + AI agents, messages, Tier-0 gates)
+- `GET /v1/rooms/{room_id}/governance/{principal_id}` — verified `RoomGovernanceEnvelope` handed off to Marlin Gateway
+- `POST /v1/rooms/{room_id}/invites` — issue scoped invite token (`role` + `scopes` + `max_uses`)
+- `POST /v1/invites/{token}/join` — redeem invite and admit human or AI agent
+- `POST /v1/rooms/{room_id}/messages` — post message with `@mention` routing and bot-loop depth guardrail
+- `GET /v1/rooms/{room_id}/events` — live Server-Sent Events stream (`room_event`)
+- `POST /v1/rooms/{room_id}/gates` — request Tier-0 governance gate
+- `POST /v1/rooms/{room_id}/gates/{gate_id}/resolve` — **Human-Only** gate resolution (AI agent actors return `403 Forbidden`)
+- `POST /v1/bridges/telegram/webhook` (`telegram`) — Telegram Bot API webhook ingress
+- `POST /v1/bridges/discord/ingress` (`discord`) — Discord ingress webhook
+
+## Environment Overrides (`MARLIN_COVE_*`)
+
+- `MARLIN_COVE_RELAY_BIND` (default `127.0.0.1:18090`)
+- `MARLIN_COVE_RELAY_AUTH_TOKEN`
+- `MARLIN_COVE_MARLIN_GATEWAY_URL` (default `http://127.0.0.1:18093`)
+- `MARLIN_COVE_MARLIN_GATEWAY_TOKEN`
+- `MARLIN_COVE_TELEGRAM_BOT_TOKEN` / `MARLIN_COVE_TELEGRAM_WEBHOOK_SECRET`
+- `MARLIN_COVE_DISCORD_BOT_TOKEN` / `MARLIN_COVE_DISCORD_BOT_USER_ID` / `MARLIN_COVE_DISCORD_INGRESS_SECRET`
+
+## Verification
 
 ```shell
-LINGCHONG_AGENT_GATEWAY_URL=http://127.0.0.1:18093 \
-  direnv exec . cargo run -- check-config
+just check
 ```
-
-Live-gated launchers should call preflight before starting channel processes:
-
-```shell
-LINGCHONG_AGENT_GATEWAY_URL=http://127.0.0.1:18093 \
-LINGCHONG_TELEGRAM_BOT_TOKEN=... \
-  direnv exec . cargo run -- preflight
-```
-
-The shell entrypoint for staged launcher handoff is:
-
-```shell
-LINGCHONG_AGENT_GATEWAY_URL=http://127.0.0.1:18093 \
-LINGCHONG_TELEGRAM_BOT_TOKEN=... \
-  direnv exec . just preflight-script
-```
-
-The secret-safe launch-plan entrypoint is:
-
-```shell
-LINGCHONG_AGENT_GATEWAY_URL=http://127.0.0.1:18093 \
-LINGCHONG_TELEGRAM_BOT_TOKEN=... \
-  direnv exec . just plan-live-script
-```
-
-The M4-B stage gate runs the deterministic channel contracts, secret-safe
-preflight, secret-safe launch-plan rendering, formatting, tests, and clippy:
-
-```shell
-direnv exec . just stage-m4b
-```
-
-Supported environment variables:
-
-- `LINGCHONG_AGENT_GATEWAY_URL`: required external agent gateway base URL.
-- `LINGCHONG_TELEGRAM_BOT_TOKEN`: enables Telegram runtime when present.
-- `LINGCHONG_TELEGRAM_WEBHOOK_SECRET`: marks Telegram webhook protection as
-  configured when present.
-- `LINGCHONG_TELEGRAM_WEBHOOK_BIND`: optional local Telegram webhook bind
-  address.
-- `LINGCHONG_TELEGRAM_WEBHOOK_PORT`: optional local Telegram webhook port.
-  Defaults to the port embedded in `LINGCHONG_TELEGRAM_WEBHOOK_BIND`, then
-  `18081`.
-- `LINGCHONG_TELEGRAM_API_BASE_URL`: optional Telegram API base URL, defaulting
-  to `https://api.telegram.org`.
-- `LINGCHONG_TELEGRAM_SESSION_PARTITION`: planned Telegram session policy,
-  using `chat`, `chat_user`, `user`, or `chat_thread_user`.
-- `LINGCHONG_DISCORD_BOT_TOKEN`: enables Discord runtime when present.
-- `LINGCHONG_DISCORD_INGRESS_SECRET`: marks Discord ingress protection as
-  configured when present.
-- `LINGCHONG_DISCORD_INGRESS_BIND`: optional local Discord ingress bind
-  address, defaulting to `127.0.0.1:18082`.
-- `LINGCHONG_DISCORD_INGRESS_PATH`: optional local Discord ingress path,
-  defaulting to `/discord/ingress`.
-- `LINGCHONG_DISCORD_INGRESS_URL`: optional explicit local Discord ingress URL
-  for probes. Defaults to the normalized bind and path.
-- `LINGCHONG_DISCORD_REQUIRE_MENTION`: optional boolean, defaulting to `true`.
-- `LINGCHONG_DISCORD_SESSION_PARTITION`: planned Discord session policy, using
-  `guild_channel_user`, `channel`, `user`, or `guild_user`.
-
-The `check-config` output is secret-safe and reports only enablement and
-presence flags.
-
-## Migration Notes
-
-The first migration slice intentionally starts with the channel substrate instead
-of copying the whole `xiuxian-daochang` crate. This prevents Wendao/Qianji/native
-tool ownership from being recreated inside the bot repository.
