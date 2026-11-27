@@ -296,22 +296,3 @@ service CoveRelayService {
   rpc ResolveGate(ResolveGateRequest) returns (GateApprovalReceipt);
   rpc WatchRoomEvents(WatchRoomEventsRequest) returns (stream RoomEvent);
 }
-
-// --- MarlinGatewayService RPC Messages ---
-
-message MarlinGatewayTurnRequest {
-  string session_id = 1;
-  RoomGovernanceEnvelope governance = 2;
-  string target_agent_handle = 3;
-  string message = 4;
-  repeated MessageAttachment attachments = 5;
-}
-
-message MarlinGatewayTurnResponse {
-  string response = 1;
-}
-
-// High-performance gRPC over HTTP/2 boundary to Marlin Gateway.
-service MarlinGatewayService {
-  rpc DispatchTurn(MarlinGatewayTurnRequest) returns (MarlinGatewayTurnResponse);
-}

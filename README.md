@@ -84,8 +84,8 @@ cargo run -- serve --config cove.example.toml
   - `PostMessage`, `DispatchTurn` (live gRPC HTTP/2 handoff to `MarlinGatewayService`)
   - `RequestGate`, `ResolveGate` (**Human-Only** Owner/Maintainer, immutable once resolved)
   - `WatchRoomEvents` (native HTTP/2 server-streaming `stream RoomEvent`)
-- **`marlin.cove.v1.MarlinGatewayService`** (outbound target `marlin_gateway.grpc_endpoint`, default `http://127.0.0.1:18093`):
-  - `DispatchTurn(MarlinGatewayTurnRequest) -> MarlinGatewayTurnResponse`
+- **`marlin.app.v1.AppServer`** (native `marlin-agent-core` gRPC HTTP/2 endpoint at `marlin_gateway.grpc_endpoint`, default `http://127.0.0.1:18093` — **zero** `marlin-cove` crate dependency in `marlin-agent-core`):
+  - `StreamTurn(StreamTurnRequest) -> stream TurnEvent` carrying Cove's verified `RoomGovernanceEnvelope` in `x-marlin-cove-*` HTTP/2 gRPC metadata headers
 - **External Third-Party HTTP Webhooks** (mounted on `relay.webhook_bind_addr`, default `127.0.0.1:18091`, **only** when `telegram` or `discord` is enabled):
   - `POST /v1/bridges/telegram/webhook` (`telegram`)
   - `POST /v1/bridges/discord/ingress` (`discord`)

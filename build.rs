@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-//! Compiles `proto/marlin/cove/v1/cove.proto` into typed `prost` + `tonic` HTTP/2 gRPC code
-//! and runs the build-time `rust-lang-project-harness` architectural gate.
+//! Compiles `marlin.cove.v1` and `marlin.app.v1` protobuf contracts into typed
+//! `prost` + `tonic` HTTP/2 gRPC code and runs the build-time harness gate.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = rust_lang_project_harness::default_rust_harness_config()
@@ -18,11 +18,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config,
     );
 
-    let schema = "proto/marlin/cove/v1/cove.proto";
-    println!("cargo:rerun-if-changed={schema}");
+    let schemas = [
+        "proto/marlin/cove/v1/cove.proto",
+        "proto/marlin/app/v1/app_server.proto",
+    ];
+    for schema in schemas {
+        println!("cargo:rerun-if-changed={schema}");
+    }
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[schema], &["proto"])?;
+        .compile_protos(&schemas, &["proto"])?;
     Ok(())
 }

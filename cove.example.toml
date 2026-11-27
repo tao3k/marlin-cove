@@ -25,7 +25,7 @@ max_grpc_message_bytes = 65536
 max_message_bytes = 16384
 
 [marlin_gateway]
-# High-performance gRPC over HTTP/2 endpoint (`marlin.cove.v1.MarlinGatewayService`)
+# Native marlin-agent-core gRPC HTTP/2 endpoint (`marlin.app.v1.AppServer`)
 grpc_endpoint = "http://127.0.0.1:18093"
 # bearer_token = "replace-with-marlin-gateway-token"
 

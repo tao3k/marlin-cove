@@ -2,17 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
+use std::pin::Pin;
+
 use marlin_cove::config::{CoveConfig, SecretValue, ServiceUrl};
+use marlin_cove::marlin_gateway::{
+    COVE_META_ACTOR_ID, COVE_META_ACTOR_ROLE, COVE_META_TAINTED_EXTERNAL,
+};
+use marlin_cove::proto_wire::app_v1;
+use marlin_cove::proto_wire::app_v1::app_server_server::{AppServer, AppServerServer};
 use marlin_cove::proto_wire::cove_v1;
 use marlin_cove::proto_wire::cove_v1::cove_relay_service_client::CoveRelayServiceClient;
-use marlin_cove::proto_wire::cove_v1::marlin_gateway_service_server::{
-    MarlinGatewayService, MarlinGatewayServiceServer,
-};
 use marlin_cove::relay::{CoveServerState, build_grpc_service};
 use pretty_assertions::assert_eq;
 use tokio::net::TcpListener;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
@@ -52,16 +56,34 @@ fn with_bearer<T>(payload: T, token: &str) -> Request<T> {
     req
 }
 
-struct MockMarlinGatewayGrpc {
+type TurnEventStream =
+    Pin<Box<dyn Stream<Item = Result<app_v1::TurnEvent, Status>> + Send + 'static>>;
+type SessionTurnEventStream =
+    Pin<Box<dyn Stream<Item = Result<app_v1::SessionTurnEvent, Status>> + Send + 'static>>;
+type WorkbenchTabsStream =
+    Pin<Box<dyn Stream<Item = Result<app_v1::WorkbenchTabsResponse, Status>> + Send + 'static>>;
+
+struct MockMarlinAppServerGrpc {
     expected_token: String,
 }
 
 #[tonic::async_trait]
-impl MarlinGatewayService for MockMarlinGatewayGrpc {
-    async fn dispatch_turn(
+impl AppServer for MockMarlinAppServerGrpc {
+    type StreamTurnStream = TurnEventStream;
+    type WatchSessionTurnStream = SessionTurnEventStream;
+    type WatchWorkbenchTabsStream = WorkbenchTabsStream;
+
+    async fn get_capabilities(
         &self,
-        request: Request<cove_v1::MarlinGatewayTurnRequest>,
-    ) -> Result<Response<cove_v1::MarlinGatewayTurnResponse>, Status> {
+        _request: Request<app_v1::GetCapabilitiesRequest>,
+    ) -> Result<Response<app_v1::GetCapabilitiesResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn stream_turn(
+        &self,
+        request: Request<app_v1::StreamTurnRequest>,
+    ) -> Result<Response<Self::StreamTurnStream>, Status> {
         let provided = request
             .metadata()
             .get("authorization")
@@ -69,15 +91,144 @@ impl MarlinGatewayService for MockMarlinGatewayGrpc {
         if provided != Some(format!("Bearer {}", self.expected_token).as_str()) {
             return Err(Status::unauthenticated("invalid gateway token"));
         }
-        let body = request.into_inner();
-        let gov = body.governance.expect("governance envelope required");
-        let reply = format!(
-            "[Marlin Gateway gRPC] role={} actor={} tainted={} reply=ok",
-            gov.actor_role, gov.actor_id, gov.tainted_external
-        );
-        Ok(Response::new(cove_v1::MarlinGatewayTurnResponse {
-            response: reply,
-        }))
+        let role = request
+            .metadata()
+            .get(COVE_META_ACTOR_ROLE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let actor = request
+            .metadata()
+            .get(COVE_META_ACTOR_ID)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let tainted = request
+            .metadata()
+            .get(COVE_META_TAINTED_EXTERNAL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let prompt_len = request.into_inner().messages.len();
+        let part1 = format!("[Marlin AppServer gRPC] role={role} actor={actor} ");
+        let part2 = format!("tainted={tainted} msgs={prompt_len} reply=ok");
+        let events = vec![
+            Ok(app_v1::TurnEvent {
+                event: Some(app_v1::turn_event::Event::Started(app_v1::TurnStarted {})),
+            }),
+            Ok(app_v1::TurnEvent {
+                event: Some(app_v1::turn_event::Event::TextDelta(app_v1::TextDelta {
+                    sequence: 1,
+                    text: part1.clone(),
+                })),
+            }),
+            Ok(app_v1::TurnEvent {
+                event: Some(app_v1::turn_event::Event::TextDelta(app_v1::TextDelta {
+                    sequence: 2,
+                    text: part2.clone(),
+                })),
+            }),
+            Ok(app_v1::TurnEvent {
+                event: Some(app_v1::turn_event::Event::Completed(
+                    app_v1::TurnCompleted {
+                        text_chunks: 2,
+                        text_bytes: (part1.len() + part2.len()) as u64,
+                    },
+                )),
+            }),
+        ];
+        Ok(Response::new(Box::pin(tokio_stream::iter(events))))
+    }
+
+    async fn start_session_turn(
+        &self,
+        _request: Request<app_v1::StartSessionTurnRequest>,
+    ) -> Result<Response<app_v1::StartSessionTurnResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn watch_session_turn(
+        &self,
+        _request: Request<app_v1::WatchSessionTurnRequest>,
+    ) -> Result<Response<Self::WatchSessionTurnStream>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn cancel_session_turn(
+        &self,
+        _request: Request<app_v1::CancelSessionTurnRequest>,
+    ) -> Result<Response<app_v1::CancelSessionTurnResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn open_session(
+        &self,
+        _request: Request<app_v1::OpenSessionRequest>,
+    ) -> Result<Response<app_v1::OpenSessionResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn get_session_summary(
+        &self,
+        _request: Request<app_v1::GetSessionSummaryRequest>,
+    ) -> Result<Response<app_v1::GetSessionSummaryResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn get_session_turn_status(
+        &self,
+        _request: Request<app_v1::GetSessionTurnStatusRequest>,
+    ) -> Result<Response<app_v1::GetSessionTurnStatusResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn get_session_turn_cancellation(
+        &self,
+        _request: Request<app_v1::GetSessionTurnCancellationRequest>,
+    ) -> Result<Response<app_v1::GetSessionTurnCancellationResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn register_task_actor(
+        &self,
+        _request: Request<app_v1::RegisterTaskActorRequest>,
+    ) -> Result<Response<app_v1::TaskActorCursorResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn dispatch_task_actor(
+        &self,
+        _request: Request<app_v1::DispatchTaskActorRequest>,
+    ) -> Result<Response<app_v1::DispatchTaskActorResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn reconcile_task_receipt(
+        &self,
+        _request: Request<app_v1::ReconcileTaskReceiptRequest>,
+    ) -> Result<Response<app_v1::ReconcileTaskReceiptResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn bind_governed_context(
+        &self,
+        _request: Request<app_v1::BindGovernedContextRequest>,
+    ) -> Result<Response<app_v1::BindGovernedContextResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn get_workbench_tabs(
+        &self,
+        _request: Request<app_v1::GetWorkbenchTabsRequest>,
+    ) -> Result<Response<app_v1::WorkbenchTabsResponse>, Status> {
+        Err(Status::unimplemented("mock"))
+    }
+
+    async fn watch_workbench_tabs(
+        &self,
+        _request: Request<app_v1::WatchWorkbenchTabsRequest>,
+    ) -> Result<Response<Self::WatchWorkbenchTabsStream>, Status> {
+        Err(Status::unimplemented("mock"))
     }
 }
 
@@ -335,7 +486,7 @@ async fn cove_grpc_live_dispatches_turn_to_marlin_gateway_over_http2() {
     let gw_incoming = TcpListenerStream::new(gw_listener);
     let gw_handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(MarlinGatewayServiceServer::new(MockMarlinGatewayGrpc {
+            .add_service(AppServerServer::new(MockMarlinAppServerGrpc {
                 expected_token: "gw-grpc-secret".to_string(),
             }))
             .serve_with_incoming(gw_incoming)
@@ -355,7 +506,7 @@ async fn cove_grpc_live_dispatches_turn_to_marlin_gateway_over_http2() {
             channel_id: "architecture".to_string(),
             author_id: "human:owner".to_string(),
             target_agent_handle: "architect".to_string(),
-            body: "@architect verify Marlin Gateway gRPC handoff".to_string(),
+            body: "@architect verify Marlin AppServer gRPC handoff".to_string(),
         })
         .await
         .unwrap()
@@ -368,11 +519,9 @@ async fn cove_grpc_live_dispatches_turn_to_marlin_gateway_over_http2() {
     assert_eq!(reply.origin, cove_v1::BridgeOrigin::MarlinGateway as i32);
     assert_eq!(reply.author_kind, cove_v1::PrincipalKind::Agent as i32);
     assert_eq!(reply.bot_chain_depth, 1);
-    assert!(
-        reply
-            .body
-            .contains("[Marlin Gateway gRPC] role=1 actor=human:owner tainted=false")
-    );
+    assert!(reply.body.contains(
+        "[Marlin AppServer gRPC] role=owner actor=human:owner tainted=false msgs=1 reply=ok"
+    ));
 
     let snapshot = client
         .get_room_snapshot(cove_v1::GetRoomSnapshotRequest {
