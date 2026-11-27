@@ -1,20 +1,40 @@
-//! Telegram and Discord bot runtime substrate for Lingchong.
-//!
-//! This crate intentionally excludes Daochang native tools. It owns channel
-//! behavior and bot-facing runtime surfaces only.
+// SPDX-FileCopyrightText: 2026 tao3k team and Contributors
+//
+// SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-/// Channel-safe bot formatting and adapter substrate.
-pub mod channels;
-/// Command-line adapter for runtime diagnostics.
+//! Marlin Cove — gRPC over HTTP/2 Cloud Room Relay, modular Telegram/Discord
+//! bot bridges, and high-order room/people/bot governance for AI-native
+//! collaboration.
+//!
+//! Governance responsibilities are cleanly separated across two layers:
+//!
+//! - **Marlin Cove (`marlin-cove`)**: Owns room membership, scoped invites,
+//!   Telegram/Discord bridge admission, anti-loop guardrails, human-only Tier-0
+//!   gate routing, and Gerbil Scheme (`agentic-ai-lab`) high-order room/people/bot
+//!   governance policies (`scheme/governance/`).
+//! - **Marlin Gateway (`marlin-agent-core`)**: Owns `.org` context storage and
+//!   agent-side atomic context projection using the verified
+//!   [`protocol::RoomGovernanceEnvelope`] forwarded over gRPC HTTP/2.
+//!
+//! Each runtime surface is an opt-in Cargo feature: `relay`, `telegram`, `discord`.
+
+/// Feature-gated Telegram and Discord bot bridge adapters.
+pub mod bridges;
+/// Command-line entrypoint.
 pub mod cli;
-/// Client boundary for external agent gateway calls.
-pub mod gateway;
-/// Deterministic channel harness helpers migrated from legacy scripts.
-pub mod harness;
-/// Environment-backed runtime configuration.
-pub mod runtime;
-/// Channel turn orchestration against the external gateway.
-pub mod turn;
+/// Typed TOML + environment configuration.
+pub mod config;
+/// Marlin Gateway (`marlin-agent-core`) gRPC client.
+pub mod marlin_gateway;
+/// Conversions between domain types and `marlin.cove.v1` protobufs.
+pub mod proto_codec;
+/// Generated `marlin.cove.v1` protobuf and gRPC types.
+pub mod proto_wire;
+/// Typed Cove domain protocol.
+pub mod protocol;
+/// Cloud Cove gRPC HTTP/2 Room Relay server, optional third-party webhooks, and state store.
+#[cfg(feature = "relay")]
+pub mod relay;
 
 #[cfg(test)]
 rust_lang_project_harness::rust_project_harness_cargo_test_gate!(

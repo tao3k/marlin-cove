@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 tao3k team and Contributors
+#
+# SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
+
+[relay]
+state = "enabled"
+# Primary gRPC over HTTP/2 endpoint (`marlin.cove.v1.CoveRelayService`)
+grpc_bind_addr = "127.0.0.1:18090"
+# Optional HTTP webhook listener mounted ONLY when telegram or discord bridge is enabled
+webhook_bind_addr = "127.0.0.1:18091"
+# auth_token = "replace-with-cove-bearer-token"
+default_room_id = "cove-main"
+default_room_title = "Marlin Cove Main"
+default_channel_id = "general"
+max_bot_chain_depth = 2
+
+[relay.limits]
+event_bus_capacity = 256
+max_rooms = 64
+max_invites = 256
+max_messages_per_room = 2048
+max_gates_per_room = 256
+max_bridge_dedup_entries = 4096
+max_grpc_message_bytes = 65536
+max_message_bytes = 16384
+
+[marlin_gateway]
+# Native marlin-agent-core gRPC HTTP/2 endpoint (`marlin.app.v1.AppServer`)
+grpc_endpoint = "http://127.0.0.1:18093"
+# bearer_token = "replace-with-marlin-gateway-token"
+
+[telegram]
+state = "disabled"
+# bot_token = "123456:ABC..."
+# webhook_secret = "replace-with-telegram-secret"
+webhook_path = "/v1/bridges/telegram/webhook"
+api_base_url = "https://api.telegram.org"
+session_partition = "chat"
+default_room_id = "cove-main"
+default_channel_id = "general"
+max_message_chars = 4096
+
+[discord]
+state = "disabled"
+# bot_token = "replace-with-discord-bot-token"
+# bot_user_id = "123456789012345678"
+# ingress_secret = "replace-with-discord-ingress-secret"
+ingress_path = "/v1/bridges/discord/ingress"
+api_base_url = "https://discord.com/api/v10"
+mention_policy = "required"
+session_partition = "guild_channel_user"
+default_room_id = "cove-main"
+default_channel_id = "general"
+max_message_chars = 2000
+
+[governance]
+default_guest_scope = "public"
+scheme_policy_entry = "scheme/governance/interface.ss"
