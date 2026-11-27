@@ -253,6 +253,7 @@ message DispatchTurnRequest {
   string author_id = 3;
   string target_agent_handle = 4;
   string body = 5;
+  string thread_root_id = 6;
 }
 
 message DispatchTurnResponse {

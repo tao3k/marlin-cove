@@ -806,6 +806,30 @@ fn default_channels(primary_channel: ChannelId) -> Result<Vec<RoomChannel>, Rela
             is_direct: false,
         });
     }
+    for (id, name, topic) in [
+        (
+            "dm:agent:architect",
+            "Architect",
+            "Direct 1:1 channel with @architect",
+        ),
+        (
+            "dm:agent:reviewer",
+            "Reviewer",
+            "Direct 1:1 channel with @reviewer",
+        ),
+        (
+            "dm:agent:security",
+            "Security",
+            "Direct 1:1 channel with @security",
+        ),
+    ] {
+        channels.push(RoomChannel {
+            id: ChannelId::new(id)?,
+            name: name.to_string(),
+            topic: topic.to_string(),
+            is_direct: true,
+        });
+    }
     Ok(channels)
 }
 

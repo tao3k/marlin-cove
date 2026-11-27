@@ -507,6 +507,7 @@ async fn cove_grpc_live_dispatches_turn_to_marlin_gateway_over_http2() {
             author_id: "human:owner".to_string(),
             target_agent_handle: "architect".to_string(),
             body: "@architect verify Marlin AppServer gRPC handoff".to_string(),
+            thread_root_id: String::new(),
         })
         .await
         .unwrap()

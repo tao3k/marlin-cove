@@ -153,10 +153,11 @@ impl MarlinGatewayClient {
             })?;
 
         let mut client = AppServerClient::new(channel);
+        let wire_text = format_role_scoped_prompt(request);
         let mut grpc_req = tonic::Request::new(StreamTurnRequest {
             messages: vec![ConversationMessage {
                 role: MessageRole::User as i32,
-                text: request.message.clone(),
+                text: wire_text,
             }],
         });
 
@@ -192,6 +193,25 @@ impl MarlinGatewayClient {
             response: assembled,
         })
     }
+}
+
+fn format_role_scoped_prompt(request: &MarlinGatewayTurnRequest) -> String {
+    let Some(handle) = request
+        .target_agent_handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return request.message.clone();
+    };
+    let clean_handle = handle.trim_start_matches('@');
+    let channel = request.governance.channel_id.as_str();
+    let actor = request.governance.actor_id.as_str();
+    format!(
+        "[Marlin Cove | Room: {} | Channel: #{channel} | Role: @{clean_handle} | Sender: {actor}]\nRespond concisely and directly in Markdown as @{clean_handle}.\n\n{}",
+        request.governance.room_id.as_str(),
+        request.message.trim()
+    )
 }
 
 fn attach_request_metadata(

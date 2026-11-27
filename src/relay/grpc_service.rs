@@ -269,6 +269,8 @@ impl CoveRelayService for CoveGrpcService {
             )
             .map_err(relay_error_to_status)?;
 
+        let thread_root_id =
+            optional_message_id(&req.thread_root_id).map_err(protocol_error_to_status)?;
         let user_message = self
             .state
             .store
@@ -276,7 +278,7 @@ impl CoveRelayService for CoveGrpcService {
                 &room_id,
                 PostMessageRequest {
                     channel_id: channel_id.clone(),
-                    thread_root_id: None,
+                    thread_root_id: thread_root_id.clone(),
                     author_id,
                     body: req.body.clone(),
                     gate_id: None,
@@ -313,7 +315,7 @@ impl CoveRelayService for CoveGrpcService {
                 &room_id,
                 PostMessageRequest {
                     channel_id,
-                    thread_root_id: Some(user_message.id.clone()),
+                    thread_root_id,
                     author_id: agent_id,
                     body: gateway_reply.response,
                     gate_id: None,
