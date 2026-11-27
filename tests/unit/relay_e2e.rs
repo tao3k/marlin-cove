@@ -514,12 +514,17 @@ async fn cove_grpc_live_dispatches_turn_to_marlin_gateway_over_http2() {
         .into_inner();
 
     let gov = dispatched.governance.unwrap();
+    let user_msg = dispatched.user_message.unwrap();
     let reply = dispatched.agent_reply.unwrap();
     assert_eq!(gov.actor_role, cove_v1::PrincipalRole::Owner as i32);
     assert!(!gov.tainted_external);
     assert_eq!(reply.origin, cove_v1::BridgeOrigin::MarlinGateway as i32);
     assert_eq!(reply.author_kind, cove_v1::PrincipalKind::Agent as i32);
     assert_eq!(reply.bot_chain_depth, 1);
+    assert_eq!(
+        reply.thread_root_id, user_msg.id,
+        "group channel @mention replies must thread under the triggering user message"
+    );
     assert!(reply.body.contains(
         "[Marlin AppServer gRPC] role=owner actor=human:owner tainted=false msgs=1 reply=ok"
     ));

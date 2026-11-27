@@ -308,6 +308,14 @@ impl CoveRelayService for CoveGrpcService {
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
 
+        let reply_thread_root_id = if thread_root_id.is_some() {
+            thread_root_id
+        } else if !channel_id.as_str().starts_with("dm:") {
+            Some(user_message.id.clone())
+        } else {
+            None
+        };
+
         let agent_reply = self
             .state
             .store
@@ -315,7 +323,7 @@ impl CoveRelayService for CoveGrpcService {
                 &room_id,
                 PostMessageRequest {
                     channel_id,
-                    thread_root_id,
+                    thread_root_id: reply_thread_root_id,
                     author_id: agent_id,
                     body: gateway_reply.response,
                     gate_id: None,
