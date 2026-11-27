@@ -83,11 +83,11 @@ fn extract_mentions_parses_unique_normalized_handles() {
 }
 
 #[test]
-fn marlin_gateway_client_validates_base_url() {
+fn marlin_gateway_client_validates_grpc_endpoint() {
     assert_eq!(
         MarlinGatewayClient::new("   ", None).unwrap_err(),
-        MarlinGatewayError::InvalidBaseUrl
+        MarlinGatewayError::InvalidEndpoint
     );
     let client = MarlinGatewayClient::new("http://127.0.0.1:18093/", None).unwrap();
-    assert_eq!(client.message_endpoint(), "http://127.0.0.1:18093/message");
+    assert_eq!(client.grpc_endpoint(), "http://127.0.0.1:18093");
 }

@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::types::{
     BindAddress, CoveConfigError, DEFAULT_COVE_CHANNEL_ID, DEFAULT_COVE_ROOM_ID,
     DEFAULT_COVE_ROOM_TITLE, DEFAULT_DISCORD_API_BASE_URL, DEFAULT_DISCORD_INGRESS_PATH,
-    DEFAULT_DISCORD_MAX_MESSAGE_CHARS, DEFAULT_EVENT_BUS_CAPACITY, DEFAULT_MARLIN_GATEWAY_URL,
-    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_BOT_CHAIN_DEPTH, DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES,
-    DEFAULT_MAX_GATES_PER_ROOM, DEFAULT_MAX_INVITES, DEFAULT_MAX_MESSAGE_BYTES,
-    DEFAULT_MAX_MESSAGES_PER_ROOM, DEFAULT_MAX_ROOMS, DEFAULT_RELAY_BIND,
-    DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
+    DEFAULT_DISCORD_MAX_MESSAGE_CHARS, DEFAULT_EVENT_BUS_CAPACITY, DEFAULT_MARLIN_GATEWAY_ENDPOINT,
+    DEFAULT_MAX_BOT_CHAIN_DEPTH, DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES, DEFAULT_MAX_GATES_PER_ROOM,
+    DEFAULT_MAX_GRPC_MESSAGE_BYTES, DEFAULT_MAX_INVITES, DEFAULT_MAX_MESSAGE_BYTES,
+    DEFAULT_MAX_MESSAGES_PER_ROOM, DEFAULT_MAX_ROOMS, DEFAULT_RELAY_GRPC_BIND,
+    DEFAULT_RELAY_WEBHOOK_BIND, DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
     DEFAULT_TELEGRAM_WEBHOOK_PATH, ExternalBotId, FeatureToggle, MentionPolicy, RoutePath,
     SecretValue, ServiceUrl, SessionPartitionName,
 };
@@ -25,7 +25,7 @@ use crate::protocol::{ChannelId, RoomId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RelayCapacityLimits {
-    /// SSE broadcast channel buffer size per room.
+    /// gRPC HTTP/2 event stream broadcast channel buffer size per room.
     pub event_bus_capacity: usize,
     /// Maximum rooms allowed in the relay store.
     pub max_rooms: usize,
@@ -37,8 +37,8 @@ pub struct RelayCapacityLimits {
     pub max_gates_per_room: usize,
     /// Maximum external bridge ids retained per room for replay deduplication.
     pub max_bridge_dedup_entries: usize,
-    /// Maximum HTTP request payload size in bytes.
-    pub max_body_bytes: usize,
+    /// Maximum gRPC message decoding / webhook payload size in bytes.
+    pub max_grpc_message_bytes: usize,
     /// Maximum single message body size in bytes.
     pub max_message_bytes: usize,
 }
@@ -52,24 +52,26 @@ impl Default for RelayCapacityLimits {
             max_messages_per_room: DEFAULT_MAX_MESSAGES_PER_ROOM,
             max_gates_per_room: DEFAULT_MAX_GATES_PER_ROOM,
             max_bridge_dedup_entries: DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_grpc_message_bytes: DEFAULT_MAX_GRPC_MESSAGE_BYTES,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
         }
     }
 }
 
-/// Cloud Cove Relay HTTP/SSE server settings.
+/// Cloud Cove Relay gRPC over HTTP/2 server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RelayConfig {
-    /// Whether the HTTP/SSE relay server is enabled.
+    /// Whether the gRPC HTTP/2 relay server is enabled.
     pub state: FeatureToggle,
-    /// Socket bind address (`host:port`).
-    pub bind_addr: BindAddress,
-    /// Optional bearer token required for all Cove API endpoints (except health/join).
+    /// Socket bind address for `marlin.cove.v1.CoveRelayService` over HTTP/2 (`host:port`).
+    pub grpc_bind_addr: BindAddress,
+    /// Optional HTTP webhook listener bind address mounted ONLY when Telegram or Discord
+    /// bridge is enabled in config and compiled.
+    pub webhook_bind_addr: Option<BindAddress>,
+    /// Optional bearer token required in gRPC `authorization` metadata for all RPCs
+    /// (except `Health` and `RedeemInvite`).
     pub auth_token: Option<SecretValue>,
-    /// Explicit CORS allowed origins (empty denies cross-origin browser requests).
-    pub allowed_origins: Vec<String>,
     /// Default seeded room identifier.
     pub default_room_id: RoomId,
     /// Default seeded room display title.
@@ -86,9 +88,9 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             state: FeatureToggle::from_bool(cfg!(feature = "relay")),
-            bind_addr: BindAddress::new(DEFAULT_RELAY_BIND),
+            grpc_bind_addr: BindAddress::new(DEFAULT_RELAY_GRPC_BIND),
+            webhook_bind_addr: Some(BindAddress::new(DEFAULT_RELAY_WEBHOOK_BIND)),
             auth_token: None,
-            allowed_origins: Vec::new(),
             default_room_id: RoomId::from_trusted(DEFAULT_COVE_ROOM_ID.to_string()),
             default_room_title: DEFAULT_COVE_ROOM_TITLE.to_string(),
             default_channel_id: ChannelId::from_trusted(DEFAULT_COVE_CHANNEL_ID.to_string()),
@@ -98,21 +100,24 @@ impl Default for RelayConfig {
     }
 }
 
-/// Marlin Gateway (`marlin-agent-core`) settings.
+/// Marlin Gateway (`marlin-agent-core`) gRPC over HTTP/2 settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MarlinGatewayConfig {
-    /// Base URL for the Marlin Gateway (`marlin-agent-core`) service.
-    pub base_url: ServiceUrl,
-    /// Optional bearer token forwarded to Marlin Gateway.
+    /// gRPC over HTTP/2 endpoint URI for Marlin Gateway (`marlin-agent-core`).
+    pub grpc_endpoint: ServiceUrl,
+    /// Optional bearer token forwarded in gRPC `authorization` metadata.
     pub bearer_token: Option<SecretValue>,
 }
 
 impl Default for MarlinGatewayConfig {
     fn default() -> Self {
         Self {
-            base_url: ServiceUrl::new("marlin_gateway.base_url", DEFAULT_MARLIN_GATEWAY_URL)
-                .expect("default marlin gateway url is valid"),
+            grpc_endpoint: ServiceUrl::new(
+                "marlin_gateway.grpc_endpoint",
+                DEFAULT_MARLIN_GATEWAY_ENDPOINT,
+            )
+            .expect("default marlin gateway endpoint is valid"),
             bearer_token: None,
         }
     }
@@ -128,7 +133,7 @@ pub struct TelegramBridgeConfig {
     pub bot_token: Option<SecretValue>,
     /// Secret verified against `X-Telegram-Bot-Api-Secret-Token`.
     pub webhook_secret: Option<SecretValue>,
-    /// Webhook mount path on the Cove Relay server.
+    /// Webhook mount path on the optional external webhook listener.
     pub webhook_path: RoutePath,
     /// Telegram Bot API base URL.
     pub api_base_url: ServiceUrl,
@@ -172,7 +177,7 @@ pub struct DiscordBridgeConfig {
     pub bot_user_id: Option<ExternalBotId>,
     /// Shared secret verified against `X-Marlin-Cove-Ingress-Secret`.
     pub ingress_secret: Option<SecretValue>,
-    /// Ingress mount path on the Cove Relay server.
+    /// Ingress mount path on the optional external webhook listener.
     pub ingress_path: RoutePath,
     /// Discord REST API base URL.
     pub api_base_url: ServiceUrl,
@@ -232,9 +237,9 @@ impl Default for GovernanceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CoveConfig {
-    /// Cloud Cove Relay settings.
+    /// Cloud Cove gRPC HTTP/2 Relay settings.
     pub relay: RelayConfig,
-    /// Marlin Gateway (`marlin-agent-core`) settings.
+    /// Marlin Gateway (`marlin-agent-core`) gRPC HTTP/2 settings.
     pub marlin_gateway: MarlinGatewayConfig,
     /// Telegram bot bridge settings.
     pub telegram: TelegramBridgeConfig,
@@ -300,8 +305,11 @@ impl CoveConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        if let Some(value) = non_empty(lookup, "MARLIN_COVE_RELAY_BIND") {
-            self.relay.bind_addr = BindAddress::new(value);
+        if let Some(value) = non_empty(lookup, "MARLIN_COVE_RELAY_GRPC_BIND") {
+            self.relay.grpc_bind_addr = BindAddress::new(value);
+        }
+        if let Some(value) = non_empty(lookup, "MARLIN_COVE_RELAY_WEBHOOK_BIND") {
+            self.relay.webhook_bind_addr = Some(BindAddress::new(value));
         }
         if let Some(value) = non_empty(lookup, "MARLIN_COVE_RELAY_ENABLED") {
             self.relay.state =
@@ -326,8 +334,9 @@ impl CoveConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        if let Some(value) = non_empty(lookup, "MARLIN_COVE_MARLIN_GATEWAY_URL") {
-            self.marlin_gateway.base_url = ServiceUrl::new("marlin_gateway.base_url", value)?;
+        if let Some(value) = non_empty(lookup, "MARLIN_COVE_MARLIN_GATEWAY_ENDPOINT") {
+            self.marlin_gateway.grpc_endpoint =
+                ServiceUrl::new("marlin_gateway.grpc_endpoint", value)?;
         }
         if let Some(value) = non_empty(lookup, "MARLIN_COVE_MARLIN_GATEWAY_TOKEN") {
             self.marlin_gateway.bearer_token = SecretValue::new(value);
@@ -411,8 +420,8 @@ impl CoveConfig {
     /// Returns [`CoveConfigError`] when any URL or path is invalid.
     pub fn validate(&self) -> Result<(), CoveConfigError> {
         let _ = ServiceUrl::new(
-            "marlin_gateway.base_url",
-            self.marlin_gateway.base_url.as_str(),
+            "marlin_gateway.grpc_endpoint",
+            self.marlin_gateway.grpc_endpoint.as_str(),
         )?;
         let _ = ServiceUrl::new("telegram.api_base_url", self.telegram.api_base_url.as_str())?;
         let _ = ServiceUrl::new("discord.api_base_url", self.discord.api_base_url.as_str())?;

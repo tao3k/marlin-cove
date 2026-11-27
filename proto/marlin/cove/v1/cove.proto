@@ -1,0 +1,317 @@
+// SPDX-FileCopyrightText: 2026 tao3k team and Contributors
+//
+// SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
+
+syntax = "proto3";
+
+package marlin.cove.v1;
+
+option go_package = "github.com/tao3k/marlin-ui/gen/marlin/cove/v1;covev1";
+
+// Whether a participant in a Cove room is a human or an AI agent.
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_HUMAN = 1;
+  PRINCIPAL_KIND_AGENT = 2;
+}
+
+// Role assigned to a principal inside a Cove room.
+enum PrincipalRole {
+  PRINCIPAL_ROLE_UNSPECIFIED = 0;
+  PRINCIPAL_ROLE_OWNER = 1;
+  PRINCIPAL_ROLE_MAINTAINER = 2;
+  PRINCIPAL_ROLE_MEMBER = 3;
+  PRINCIPAL_ROLE_EXTERNAL_GUEST = 4;
+  PRINCIPAL_ROLE_ROLE_AGENT = 5;
+}
+
+// Live presence state for a room member or agent.
+enum PresenceStatus {
+  PRESENCE_STATUS_UNSPECIFIED = 0;
+  PRESENCE_STATUS_ONLINE = 1;
+  PRESENCE_STATUS_THINKING = 2;
+  PRESENCE_STATUS_WORKING = 3;
+  PRESENCE_STATUS_IDLE = 4;
+  PRESENCE_STATUS_OFFLINE = 5;
+}
+
+// Origin transport for a message entering a Cove room.
+enum BridgeOrigin {
+  BRIDGE_ORIGIN_UNSPECIFIED = 0;
+  BRIDGE_ORIGIN_COVE_NATIVE = 1;
+  BRIDGE_ORIGIN_TELEGRAM = 2;
+  BRIDGE_ORIGIN_DISCORD = 3;
+  BRIDGE_ORIGIN_MARLIN_GATEWAY = 4;
+}
+
+// Decision recorded for a Tier-0 governance gate.
+enum GateDecision {
+  GATE_DECISION_UNSPECIFIED = 0;
+  GATE_DECISION_PENDING = 1;
+  GATE_DECISION_APPROVED = 2;
+  GATE_DECISION_DENIED = 3;
+}
+
+// Service health indicator.
+enum ServiceHealthStatus {
+  SERVICE_HEALTH_STATUS_UNSPECIFIED = 0;
+  SERVICE_HEALTH_STATUS_OK = 1;
+}
+
+// Structured attachment on a room or bridge message.
+message MessageAttachment {
+  oneof kind {
+    string image_url = 1;
+  }
+}
+
+// Verified room/people/bot governance envelope forwarded to Marlin Gateway.
+message RoomGovernanceEnvelope {
+  string room_id = 1;
+  string channel_id = 2;
+  string actor_id = 3;
+  PrincipalKind actor_kind = 4;
+  PrincipalRole actor_role = 5;
+  repeated string granted_scopes = 6;
+  BridgeOrigin origin = 7;
+  bool tainted_external = 8;
+}
+
+// Participant profile inside a Cove room.
+message RoomParticipant {
+  string id = 1;
+  string display_name = 2;
+  string handle = 3;
+  PrincipalKind kind = 4;
+  PrincipalRole role = 5;
+  repeated string scopes = 6;
+  PresenceStatus presence = 7;
+}
+
+// Channel inside a Cove room.
+message RoomChannel {
+  string id = 1;
+  string name = 2;
+  string topic = 3;
+  bool is_direct = 4;
+}
+
+// Scoped invite granting entry to a Cove room.
+message RoomInvite {
+  string token = 1;
+  string room_id = 2;
+  string issued_by = 3;
+  PrincipalRole grant_role = 4;
+  repeated string grant_scopes = 5;
+  uint32 max_uses = 6;
+  uint32 uses = 7;
+}
+
+// Immutable timeline message in a Cove room.
+message RoomMessage {
+  string id = 1;
+  string room_id = 2;
+  string channel_id = 3;
+  string thread_root_id = 4;
+  string author_id = 5;
+  PrincipalKind author_kind = 6;
+  string body = 7;
+  repeated string mentions = 8;
+  string gate_id = 9;
+  repeated MessageAttachment attachments = 10;
+  BridgeOrigin origin = 11;
+  uint32 bot_chain_depth = 12;
+  uint64 created_at_unix = 13;
+}
+
+// Typed receipt recording human-only resolution of a Tier-0 gate.
+message GateApprovalReceipt {
+  string gate_id = 1;
+  string resolved_by = 2;
+  GateDecision decision = 3;
+  string reason = 4;
+  uint64 resolved_at_unix = 5;
+}
+
+// Tier-0 PromptGate item embedded in a Cove room.
+message RoomGate {
+  string id = 1;
+  string room_id = 2;
+  string channel_id = 3;
+  string requested_by = 4;
+  string summary = 5;
+  string capability = 6;
+  GateDecision decision = 7;
+  GateApprovalReceipt receipt = 8;
+}
+
+// Compact room summary for listing endpoints.
+message RoomSummary {
+  string room_id = 1;
+  string title = 2;
+  uint64 channel_count = 3;
+  uint64 participant_count = 4;
+  uint64 message_count = 5;
+  uint64 pending_gates = 6;
+}
+
+// Full room snapshot returned upon connect or resync.
+message RoomSnapshot {
+  string room_id = 1;
+  string title = 2;
+  uint64 latest_seq = 3;
+  repeated RoomChannel channels = 4;
+  repeated RoomParticipant participants = 5;
+  repeated RoomMessage messages = 6;
+  repeated RoomGate gates = 7;
+}
+
+// Presence change payload inside RoomEvent.
+message PresenceChangedEvent {
+  string principal_id = 1;
+  PresenceStatus presence = 2;
+}
+
+// Monotonic real-time event streamed over HTTP/2 server-streaming gRPC.
+message RoomEvent {
+  uint64 seq = 1;
+  string room_id = 2;
+  oneof kind {
+    RoomMessage message_posted = 3;
+    RoomParticipant participant_joined = 4;
+    PresenceChangedEvent presence_changed = 5;
+    RoomGate gate_requested = 6;
+    GateApprovalReceipt gate_resolved = 7;
+  }
+}
+
+// --- CoveRelayService RPC Messages ---
+
+message HealthRequest {}
+
+message HealthResponse {
+  ServiceHealthStatus status = 1;
+  string service = 2;
+  repeated string features = 3;
+}
+
+message ListRoomsRequest {}
+
+message ListRoomsResponse {
+  repeated RoomSummary rooms = 1;
+}
+
+message CreateRoomRequest {
+  string room_id = 1;
+  string title = 2;
+  string owner_id = 3;
+  string owner_name = 4;
+  string owner_handle = 5;
+}
+
+message GetRoomSnapshotRequest {
+  string room_id = 1;
+}
+
+message GetGovernanceEnvelopeRequest {
+  string room_id = 1;
+  string principal_id = 2;
+  string channel_id = 3;
+}
+
+message CreateInviteRequest {
+  string room_id = 1;
+  string issued_by = 2;
+  PrincipalRole grant_role = 3;
+  repeated string grant_scopes = 4;
+  uint32 max_uses = 5;
+}
+
+message RedeemInviteRequest {
+  string token = 1;
+  string principal_id = 2;
+  string display_name = 3;
+  string handle = 4;
+  PrincipalKind kind = 5;
+}
+
+message PostMessageRequest {
+  string room_id = 1;
+  string channel_id = 2;
+  string thread_root_id = 3;
+  string author_id = 4;
+  string body = 5;
+  string gate_id = 6;
+  repeated MessageAttachment attachments = 7;
+  BridgeOrigin origin = 8;
+  uint32 bot_chain_depth = 9;
+}
+
+message DispatchTurnRequest {
+  string room_id = 1;
+  string channel_id = 2;
+  string author_id = 3;
+  string target_agent_handle = 4;
+  string body = 5;
+}
+
+message DispatchTurnResponse {
+  RoomMessage user_message = 1;
+  RoomGovernanceEnvelope governance = 2;
+  RoomMessage agent_reply = 3;
+}
+
+message RequestGateRequest {
+  string room_id = 1;
+  string channel_id = 2;
+  string requested_by = 3;
+  string summary = 4;
+  string capability = 5;
+}
+
+message ResolveGateRequest {
+  string room_id = 1;
+  string gate_id = 2;
+  string actor_id = 3;
+  bool approved = 4;
+  string reason = 5;
+}
+
+message WatchRoomEventsRequest {
+  string room_id = 1;
+}
+
+// High-performance gRPC over HTTP/2 Cloud Room Relay service.
+service CoveRelayService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc ListRooms(ListRoomsRequest) returns (ListRoomsResponse);
+  rpc CreateRoom(CreateRoomRequest) returns (RoomSnapshot);
+  rpc GetRoomSnapshot(GetRoomSnapshotRequest) returns (RoomSnapshot);
+  rpc GetGovernanceEnvelope(GetGovernanceEnvelopeRequest) returns (RoomGovernanceEnvelope);
+  rpc CreateInvite(CreateInviteRequest) returns (RoomInvite);
+  rpc RedeemInvite(RedeemInviteRequest) returns (RoomParticipant);
+  rpc PostMessage(PostMessageRequest) returns (RoomMessage);
+  rpc DispatchTurn(DispatchTurnRequest) returns (DispatchTurnResponse);
+  rpc RequestGate(RequestGateRequest) returns (RoomGate);
+  rpc ResolveGate(ResolveGateRequest) returns (GateApprovalReceipt);
+  rpc WatchRoomEvents(WatchRoomEventsRequest) returns (stream RoomEvent);
+}
+
+// --- MarlinGatewayService RPC Messages ---
+
+message MarlinGatewayTurnRequest {
+  string session_id = 1;
+  RoomGovernanceEnvelope governance = 2;
+  string target_agent_handle = 3;
+  string message = 4;
+  repeated MessageAttachment attachments = 5;
+}
+
+message MarlinGatewayTurnResponse {
+  string response = 1;
+}
+
+// High-performance gRPC over HTTP/2 boundary to Marlin Gateway.
+service MarlinGatewayService {
+  rpc DispatchTurn(MarlinGatewayTurnRequest) returns (MarlinGatewayTurnResponse);
+}

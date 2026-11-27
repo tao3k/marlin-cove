@@ -35,14 +35,16 @@ pub fn compiled_features() -> Vec<&'static str> {
 pub struct CoveConfigSummary {
     /// Cargo features compiled into this build.
     pub compiled_features: Vec<&'static str>,
-    /// Effective relay status.
+    /// Effective gRPC relay status.
     pub relay_state: FeatureToggle,
-    /// Relay bind address.
-    pub relay_bind: BindAddress,
+    /// Relay gRPC over HTTP/2 bind address.
+    pub relay_grpc_bind: BindAddress,
+    /// Optional third-party webhook bind address.
+    pub relay_webhook_bind: Option<BindAddress>,
     /// Whether relay bearer token is configured.
     pub relay_auth_token: SecretState,
-    /// Marlin Gateway (`marlin-agent-core`) URL.
-    pub marlin_gateway_url: ServiceUrl,
+    /// Marlin Gateway (`marlin-agent-core`) gRPC HTTP/2 endpoint.
+    pub marlin_gateway_endpoint: ServiceUrl,
     /// Whether Marlin Gateway bearer token is configured.
     pub marlin_gateway_token: SecretState,
     /// Effective Telegram bridge status.
@@ -68,9 +70,10 @@ impl CoveConfigSummary {
             relay_state: FeatureToggle::from_bool(
                 config.relay.state.is_enabled() && cfg!(feature = "relay"),
             ),
-            relay_bind: config.relay.bind_addr.clone(),
+            relay_grpc_bind: config.relay.grpc_bind_addr.clone(),
+            relay_webhook_bind: config.relay.webhook_bind_addr.clone(),
             relay_auth_token: SecretState::from_secret(config.relay.auth_token.as_ref()),
-            marlin_gateway_url: config.marlin_gateway.base_url.clone(),
+            marlin_gateway_endpoint: config.marlin_gateway.grpc_endpoint.clone(),
             marlin_gateway_token: SecretState::from_secret(
                 config.marlin_gateway.bearer_token.as_ref(),
             ),
@@ -94,12 +97,20 @@ impl CoveConfigSummary {
     /// Render key=value diagnostic lines guaranteed to omit secret material.
     #[must_use]
     pub fn render_lines(&self) -> Vec<String> {
+        let webhook_bind = self
+            .relay_webhook_bind
+            .as_ref()
+            .map_or("disabled", BindAddress::as_str);
         vec![
             format!("compiled_features={}", self.compiled_features.join(",")),
             format!("relay_state={}", self.relay_state.as_str()),
-            format!("relay_bind={}", self.relay_bind.as_str()),
+            format!("relay_grpc_bind={}", self.relay_grpc_bind.as_str()),
+            format!("relay_webhook_bind={webhook_bind}"),
             format!("relay_auth_token={}", self.relay_auth_token.as_str()),
-            format!("marlin_gateway_url={}", self.marlin_gateway_url.as_str()),
+            format!(
+                "marlin_gateway_endpoint={}",
+                self.marlin_gateway_endpoint.as_str()
+            ),
             format!(
                 "marlin_gateway_token={}",
                 self.marlin_gateway_token.as_str()
@@ -259,19 +270,19 @@ const fn has_any_compiled_active_surface(config: &CoveConfig) -> bool {
 /// Planned active endpoint in a secret-safe Cove launch plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedSurface {
-    /// Native Cloud Cove Relay HTTP + SSE server.
-    CoveRelay {
+    /// Native Cloud Cove Relay gRPC over HTTP/2 server.
+    CoveRelayGrpc {
         /// Bound socket address.
-        bind_addr: BindAddress,
+        grpc_bind_addr: BindAddress,
     },
-    /// Telegram webhook bridge mounted on the Cove server.
+    /// Telegram webhook bridge mounted on the optional external HTTP webhook listener.
     TelegramWebhook {
         /// Mounted route path.
         path: RoutePath,
         /// Session partitioning strategy.
         session_partition: SessionPartitionName,
     },
-    /// Discord ingress bridge mounted on the Cove server.
+    /// Discord ingress bridge mounted on the optional external HTTP webhook listener.
     DiscordIngress {
         /// Mounted route path.
         path: RoutePath,
@@ -287,8 +298,8 @@ pub enum PlannedSurface {
 pub struct LaunchPlan {
     /// Planned active surfaces.
     pub surfaces: Vec<PlannedSurface>,
-    /// Marlin Gateway (`marlin-agent-core`) target URL.
-    pub marlin_gateway_url: ServiceUrl,
+    /// Marlin Gateway (`marlin-agent-core`) gRPC HTTP/2 endpoint.
+    pub marlin_gateway_endpoint: ServiceUrl,
 }
 
 impl LaunchPlan {
@@ -297,8 +308,8 @@ impl LaunchPlan {
     pub fn from_config(config: &CoveConfig) -> Self {
         let mut surfaces = Vec::new();
         if config.relay.state.is_enabled() && cfg!(feature = "relay") {
-            surfaces.push(PlannedSurface::CoveRelay {
-                bind_addr: config.relay.bind_addr.clone(),
+            surfaces.push(PlannedSurface::CoveRelayGrpc {
+                grpc_bind_addr: config.relay.grpc_bind_addr.clone(),
             });
         }
         if config.telegram.state.is_enabled() && cfg!(feature = "telegram") {
@@ -316,7 +327,7 @@ impl LaunchPlan {
         }
         Self {
             surfaces,
-            marlin_gateway_url: config.marlin_gateway.base_url.clone(),
+            marlin_gateway_endpoint: config.marlin_gateway.grpc_endpoint.clone(),
         }
     }
 
@@ -339,8 +350,8 @@ impl LaunchPlan {
                 }
             ),
             format!(
-                "cove_marlin_gateway_url={}",
-                self.marlin_gateway_url.as_str()
+                "cove_marlin_gateway_endpoint={}",
+                self.marlin_gateway_endpoint.as_str()
             ),
             format!("cove_surface_count={}", self.surfaces.len()),
         ];
@@ -351,8 +362,8 @@ impl LaunchPlan {
 
 fn render_surface_line(surface: &PlannedSurface) -> String {
     match surface {
-        PlannedSurface::CoveRelay { bind_addr } => {
-            format!("surface=cove_relay bind={}", bind_addr.as_str())
+        PlannedSurface::CoveRelayGrpc { grpc_bind_addr } => {
+            format!("surface=cove_relay_grpc bind={}", grpc_bind_addr.as_str())
         }
         PlannedSurface::TelegramWebhook {
             path,

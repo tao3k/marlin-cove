@@ -2,15 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-//! Typed client boundary for dispatching Cove room and bridge turns to
-//! **Marlin Gateway** (`marlin-agent-core`).
+//! Typed gRPC HTTP/2 client for Marlin Gateway (`marlin-agent-core`).
 //!
-//! Cove forwards a verified [`RoomGovernanceEnvelope`] so `marlin-agent-core`
-//! can enforce its own atomic `.org` context governance cleanly on the agent side.
+//! Cove forwards a verified [`RoomGovernanceEnvelope`] over HTTP/2 protobuf so
+//! `marlin-agent-core` enforces its own atomic `.org` context governance on the
+//! agent side.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Endpoint;
 
+use crate::proto_codec::{attachment_to_proto, governance_envelope_to_proto};
+use crate::proto_wire::cove_v1;
+use crate::proto_wire::cove_v1::marlin_gateway_service_client::MarlinGatewayServiceClient;
 use crate::protocol::{MessageAttachment, RoomGovernanceEnvelope, SessionKey};
 
 /// Typed turn dispatch request sent from Marlin Cove to Marlin Gateway (`marlin-agent-core`).
@@ -40,89 +45,115 @@ pub struct MarlinGatewayTurnResponse {
 /// Errors produced when building or invoking [`MarlinGatewayClient`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MarlinGatewayError {
-    /// Marlin Gateway base URL was empty or malformed.
-    #[error("Marlin Gateway base URL is empty or invalid")]
-    InvalidBaseUrl,
-    /// HTTP request or JSON decoding failed.
-    #[error("Marlin Gateway request failed: {message}")]
+    /// Marlin Gateway gRPC endpoint URL was empty or malformed.
+    #[error("Marlin Gateway gRPC endpoint is empty or invalid")]
+    InvalidEndpoint,
+    /// Bearer token contained non-ASCII characters invalid for HTTP/2 metadata.
+    #[error("Marlin Gateway bearer token is not valid ASCII metadata")]
+    InvalidBearerToken,
+    /// gRPC HTTP/2 connection or RPC invocation failed.
+    #[error("Marlin Gateway gRPC request failed: {message}")]
     Request {
         /// Diagnostic failure description.
         message: String,
     },
 }
 
-/// Async HTTP client targeting Marlin Gateway (`marlin-agent-core`).
+/// Async gRPC over HTTP/2 client targeting Marlin Gateway (`marlin-agent-core`).
 #[derive(Debug, Clone)]
 pub struct MarlinGatewayClient {
-    base_url: String,
+    endpoint: String,
     bearer_token: Option<String>,
-    http: reqwest::Client,
 }
 
 impl MarlinGatewayClient {
-    /// Construct a Marlin Gateway client from a base URL and optional bearer token.
+    /// Construct a Marlin Gateway gRPC HTTP/2 client from an endpoint URI and
+    /// optional bearer token.
     ///
     /// # Errors
     ///
-    /// Returns [`MarlinGatewayError::InvalidBaseUrl`] when the URL is blank.
+    /// Returns [`MarlinGatewayError::InvalidEndpoint`] when the URI is blank or malformed.
     pub fn new(
-        base_url: impl Into<String>,
+        endpoint: impl Into<String>,
         bearer_token: Option<String>,
     ) -> Result<Self, MarlinGatewayError> {
-        let raw = base_url.into();
+        let raw = endpoint.into();
         let trimmed = raw.trim().trim_end_matches('/');
         if trimmed.is_empty() {
-            return Err(MarlinGatewayError::InvalidBaseUrl);
+            return Err(MarlinGatewayError::InvalidEndpoint);
+        }
+        let _ = Endpoint::from_shared(trimmed.to_string())
+            .map_err(|_| MarlinGatewayError::InvalidEndpoint)?;
+
+        let normalized_token = bearer_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        if let Some(token) = &normalized_token {
+            let header = format!("Bearer {token}");
+            if MetadataValue::try_from(header.as_str()).is_err() {
+                return Err(MarlinGatewayError::InvalidBearerToken);
+            }
         }
 
         Ok(Self {
-            base_url: trimmed.to_string(),
-            bearer_token: bearer_token
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty()),
-            http: reqwest::Client::new(),
+            endpoint: trimmed.to_string(),
+            bearer_token: normalized_token,
         })
     }
 
-    /// Return the concrete `/message` endpoint URL on Marlin Gateway.
+    /// Return the configured Marlin Gateway gRPC HTTP/2 endpoint URI.
     #[must_use]
-    pub fn message_endpoint(&self) -> String {
-        format!("{}/message", self.base_url)
+    pub fn grpc_endpoint(&self) -> &str {
+        &self.endpoint
     }
 
-    /// Dispatch a typed turn request carrying Cove's [`RoomGovernanceEnvelope`].
+    /// Dispatch a typed turn request carrying Cove's [`RoomGovernanceEnvelope`]
+    /// over gRPC HTTP/2 (`marlin.cove.v1.MarlinGatewayService/DispatchTurn`).
     ///
     /// # Errors
     ///
-    /// Returns [`MarlinGatewayError::Request`] when transport, status, or JSON decoding fails.
+    /// Returns [`MarlinGatewayError::Request`] when HTTP/2 transport or RPC fails.
     pub async fn dispatch_turn(
         &self,
         request: &MarlinGatewayTurnRequest,
     ) -> Result<MarlinGatewayTurnResponse, MarlinGatewayError> {
-        let mut builder = self.http.post(self.message_endpoint()).json(request);
-        if let Some(token) = &self.bearer_token {
-            builder = builder.bearer_auth(token);
-        }
-
-        let response = builder
-            .send()
+        let channel = Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|_| MarlinGatewayError::InvalidEndpoint)?
+            .connect()
             .await
             .map_err(|source| MarlinGatewayError::Request {
                 message: source.to_string(),
             })?;
 
-        let response =
-            response
-                .error_for_status()
-                .map_err(|source| MarlinGatewayError::Request {
-                    message: source.to_string(),
-                })?;
+        let mut client = MarlinGatewayServiceClient::new(channel);
+        let proto_req = cove_v1::MarlinGatewayTurnRequest {
+            session_id: request.session_id.to_string(),
+            governance: Some(governance_envelope_to_proto(&request.governance)),
+            target_agent_handle: request.target_agent_handle.clone().unwrap_or_default(),
+            message: request.message.clone(),
+            attachments: request
+                .attachments
+                .iter()
+                .map(attachment_to_proto)
+                .collect(),
+        };
+        let mut grpc_req = tonic::Request::new(proto_req);
+        if let Some(token) = &self.bearer_token {
+            let value = MetadataValue::try_from(format!("Bearer {token}").as_str())
+                .map_err(|_| MarlinGatewayError::InvalidBearerToken)?;
+            grpc_req.metadata_mut().insert("authorization", value);
+        }
 
-        response
-            .json::<MarlinGatewayTurnResponse>()
+        let response = client
+            .dispatch_turn(grpc_req)
             .await
-            .map_err(|source| MarlinGatewayError::Request {
-                message: source.to_string(),
-            })
+            .map_err(|status| MarlinGatewayError::Request {
+                message: status.to_string(),
+            })?
+            .into_inner();
+
+        Ok(MarlinGatewayTurnResponse {
+            response: response.response,
+        })
     }
 }

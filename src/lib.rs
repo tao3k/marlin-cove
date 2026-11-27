@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-//! Marlin Cove — Cloud Room Relay, modular Telegram/Discord bot bridges, and
-//! high-order room/people/bot governance for AI-native collaboration.
+//! Marlin Cove — gRPC over HTTP/2 Cloud Room Relay, modular Telegram/Discord
+//! bot bridges, and high-order room/people/bot governance for AI-native
+//! collaboration.
 //!
 //! Governance responsibilities are cleanly separated across two layers:
 //!
@@ -13,7 +14,7 @@
 //!   governance policies (`scheme/governance/`).
 //! - **Marlin Gateway (`marlin-agent-core`)**: Owns `.org` context storage and
 //!   agent-side atomic context projection using the verified
-//!   [`protocol::RoomGovernanceEnvelope`] forwarded by Cove.
+//!   [`protocol::RoomGovernanceEnvelope`] forwarded over gRPC HTTP/2.
 //!
 //! Each runtime surface is an opt-in Cargo feature: `relay`, `telegram`, `discord`.
 
@@ -23,11 +24,15 @@ pub mod bridges;
 pub mod cli;
 /// Typed TOML + environment configuration.
 pub mod config;
-/// Typed client boundary for Marlin Gateway (`marlin-agent-core`).
+/// Marlin Gateway (`marlin-agent-core`) gRPC client.
 pub mod marlin_gateway;
+/// Conversions between domain types and `marlin.cove.v1` protobufs.
+pub mod proto_codec;
+/// Generated `marlin.cove.v1` protobuf and gRPC types.
+pub mod proto_wire;
 /// Typed Cove domain protocol.
 pub mod protocol;
-/// Cloud Cove Room Relay server and state store.
+/// Cloud Cove gRPC HTTP/2 Room Relay server, optional third-party webhooks, and state store.
 #[cfg(feature = "relay")]
 pub mod relay;
 

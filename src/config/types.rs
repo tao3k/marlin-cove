@@ -9,10 +9,12 @@ use std::fmt::Formatter;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Default local bind address for the Cloud Cove Relay HTTP/SSE server.
-pub const DEFAULT_RELAY_BIND: &str = "127.0.0.1:18090";
-/// Default Marlin Gateway (`marlin-agent-core`) base URL.
-pub const DEFAULT_MARLIN_GATEWAY_URL: &str = "http://127.0.0.1:18093";
+/// Default local bind address for the Cloud Cove gRPC over HTTP/2 server.
+pub const DEFAULT_RELAY_GRPC_BIND: &str = "127.0.0.1:18090";
+/// Default local bind address for the optional third-party HTTP webhook listener.
+pub const DEFAULT_RELAY_WEBHOOK_BIND: &str = "127.0.0.1:18091";
+/// Default Marlin Gateway (`marlin-agent-core`) gRPC over HTTP/2 endpoint URI.
+pub const DEFAULT_MARLIN_GATEWAY_ENDPOINT: &str = "http://127.0.0.1:18093";
 /// Default Telegram Bot API base URL.
 pub const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 /// Default Telegram webhook route path.
@@ -29,7 +31,7 @@ pub const DEFAULT_COVE_ROOM_TITLE: &str = "Marlin Cove Main";
 pub const DEFAULT_COVE_CHANNEL_ID: &str = "general";
 /// Maximum bot-to-bot reply chain depth allowed before fail-closed suppression.
 pub const DEFAULT_MAX_BOT_CHAIN_DEPTH: u8 = 2;
-/// Default SSE broadcast channel capacity per room.
+/// Default gRPC event stream broadcast channel capacity per room.
 pub const DEFAULT_EVENT_BUS_CAPACITY: usize = 256;
 /// Default maximum number of rooms retained in memory (`CapacityModel` bound).
 pub const DEFAULT_MAX_ROOMS: usize = 64;
@@ -41,8 +43,8 @@ pub const DEFAULT_MAX_MESSAGES_PER_ROOM: usize = 2048;
 pub const DEFAULT_MAX_GATES_PER_ROOM: usize = 256;
 /// Default maximum external webhook ids retained per room for replay deduplication.
 pub const DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES: usize = 4096;
-/// Default maximum HTTP request payload size in bytes (64 KiB).
-pub const DEFAULT_MAX_BODY_BYTES: usize = 65_536;
+/// Default maximum gRPC / webhook payload size in bytes (64 KiB).
+pub const DEFAULT_MAX_GRPC_MESSAGE_BYTES: usize = 65_536;
 /// Default maximum single message body size in bytes (16 KiB).
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16_384;
 /// Default Telegram outbound chunk character ceiling.
@@ -221,7 +223,7 @@ impl MentionPolicy {
     }
 }
 
-/// Validated HTTP(S) URL newtype.
+/// Validated HTTP(S) endpoint URL newtype.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ServiceUrl(String);

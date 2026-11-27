@@ -4,9 +4,11 @@
 
 [relay]
 state = "enabled"
-bind_addr = "127.0.0.1:18090"
+# Primary gRPC over HTTP/2 endpoint (`marlin.cove.v1.CoveRelayService`)
+grpc_bind_addr = "127.0.0.1:18090"
+# Optional HTTP webhook listener mounted ONLY when telegram or discord bridge is enabled
+webhook_bind_addr = "127.0.0.1:18091"
 # auth_token = "replace-with-cove-bearer-token"
-allowed_origins = []
 default_room_id = "cove-main"
 default_room_title = "Marlin Cove Main"
 default_channel_id = "general"
@@ -19,11 +21,12 @@ max_invites = 256
 max_messages_per_room = 2048
 max_gates_per_room = 256
 max_bridge_dedup_entries = 4096
-max_body_bytes = 65536
+max_grpc_message_bytes = 65536
 max_message_bytes = 16384
 
 [marlin_gateway]
-base_url = "http://127.0.0.1:18093"
+# High-performance gRPC over HTTP/2 endpoint (`marlin.cove.v1.MarlinGatewayService`)
+grpc_endpoint = "http://127.0.0.1:18093"
 # bearer_token = "replace-with-marlin-gateway-token"
 
 [telegram]

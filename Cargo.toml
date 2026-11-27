@@ -8,7 +8,7 @@
 name = "marlin-cove"
 version = "0.2.0"
 edition = "2024"
-description = "Marlin Cove — Cloud Room Relay, modular Telegram/Discord bot bridges, and high-order room/people/bot governance"
+description = "Marlin Cove — gRPC HTTP/2 Cloud Room Relay, modular Telegram/Discord bot bridges, and high-order room/people/bot governance"
 authors = ["tao3k team and Contributors"]
 license = "Apache-2.0 AND LGPL-2.1-or-later"
 repository = "https://github.com/tao3k/marlin-cove"
@@ -27,39 +27,48 @@ bench = false
 default = ["relay", "telegram", "discord"]
 full = ["relay", "telegram", "discord"]
 relay = [
+    "dep:async-stream",
     "dep:axum",
     "dep:tokio",
     "dep:tokio-stream",
-    "dep:tower-http",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:uuid",
 ]
-telegram = ["dep:pulldown-cmark"]
-discord = []
+telegram = ["dep:pulldown-cmark", "dep:reqwest"]
+discord = ["dep:reqwest"]
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+prost = "=0.14.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "1.2"
+tonic = "=0.14.9"
+tonic-prost = "=0.14.9"
 
-# Feature: relay
+# Feature: relay (gRPC HTTP/2 core + optional third-party HTTP webhook ingress)
+async-stream = { version = "0.3.6", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
-tokio-stream = { version = "0.1", features = ["sync"], optional = true }
-tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
+tokio-stream = { version = "0.1", features = ["net", "sync"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 
-# Feature: telegram
+# Feature: telegram / discord outbound third-party APIs
 pulldown-cmark = { version = "0.13", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+
+[build-dependencies]
+rust-lang-project-harness = { git = "https://github.com/tao3k/rust-lang-project-harness", rev = "51ca03c55960c008d9280e6b290474645de0b813" }
+tonic-prost-build = "=0.14.6"
 
 [dev-dependencies]
 pretty_assertions = "1"
 rust-lang-project-harness = { git = "https://github.com/tao3k/rust-lang-project-harness", rev = "51ca03c55960c008d9280e6b290474645de0b813" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
