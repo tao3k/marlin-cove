@@ -9,13 +9,54 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::types::{
-    BindAddress, CoveConfigError, DEFAULT_COVE_ROOM_ID, DEFAULT_DISCORD_API_BASE_URL,
-    DEFAULT_DISCORD_INGRESS_PATH, DEFAULT_MARLIN_GATEWAY_URL, DEFAULT_MAX_BOT_CHAIN_DEPTH,
-    DEFAULT_RELAY_BIND, DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_WEBHOOK_PATH,
-    ExternalBotId, FeatureToggle, MentionPolicy, RoutePath, SecretValue, ServiceUrl,
-    SessionPartitionName,
+    BindAddress, CoveConfigError, DEFAULT_COVE_CHANNEL_ID, DEFAULT_COVE_ROOM_ID,
+    DEFAULT_COVE_ROOM_TITLE, DEFAULT_DISCORD_API_BASE_URL, DEFAULT_DISCORD_INGRESS_PATH,
+    DEFAULT_DISCORD_MAX_MESSAGE_CHARS, DEFAULT_EVENT_BUS_CAPACITY, DEFAULT_MARLIN_GATEWAY_URL,
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_BOT_CHAIN_DEPTH, DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES,
+    DEFAULT_MAX_GATES_PER_ROOM, DEFAULT_MAX_INVITES, DEFAULT_MAX_MESSAGE_BYTES,
+    DEFAULT_MAX_MESSAGES_PER_ROOM, DEFAULT_MAX_ROOMS, DEFAULT_RELAY_BIND,
+    DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
+    DEFAULT_TELEGRAM_WEBHOOK_PATH, ExternalBotId, FeatureToggle, MentionPolicy, RoutePath,
+    SecretValue, ServiceUrl, SessionPartitionName,
 };
-use crate::protocol::RoomId;
+use crate::protocol::{ChannelId, RoomId};
+
+/// Bounded capacity limits instantiating `deterministic-engineering`'s `CapacityModel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayCapacityLimits {
+    /// SSE broadcast channel buffer size per room.
+    pub event_bus_capacity: usize,
+    /// Maximum rooms allowed in the relay store.
+    pub max_rooms: usize,
+    /// Maximum active invite tokens allowed.
+    pub max_invites: usize,
+    /// Maximum timeline messages retained per room.
+    pub max_messages_per_room: usize,
+    /// Maximum Tier-0 governance gates retained per room.
+    pub max_gates_per_room: usize,
+    /// Maximum external bridge ids retained per room for replay deduplication.
+    pub max_bridge_dedup_entries: usize,
+    /// Maximum HTTP request payload size in bytes.
+    pub max_body_bytes: usize,
+    /// Maximum single message body size in bytes.
+    pub max_message_bytes: usize,
+}
+
+impl Default for RelayCapacityLimits {
+    fn default() -> Self {
+        Self {
+            event_bus_capacity: DEFAULT_EVENT_BUS_CAPACITY,
+            max_rooms: DEFAULT_MAX_ROOMS,
+            max_invites: DEFAULT_MAX_INVITES,
+            max_messages_per_room: DEFAULT_MAX_MESSAGES_PER_ROOM,
+            max_gates_per_room: DEFAULT_MAX_GATES_PER_ROOM,
+            max_bridge_dedup_entries: DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        }
+    }
+}
 
 /// Cloud Cove Relay HTTP/SSE server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,10 +66,20 @@ pub struct RelayConfig {
     pub state: FeatureToggle,
     /// Socket bind address (`host:port`).
     pub bind_addr: BindAddress,
-    /// Optional bearer token required for native Cove API writes.
+    /// Optional bearer token required for all Cove API endpoints (except health/join).
     pub auth_token: Option<SecretValue>,
+    /// Explicit CORS allowed origins (empty denies cross-origin browser requests).
+    pub allowed_origins: Vec<String>,
+    /// Default seeded room identifier.
+    pub default_room_id: RoomId,
+    /// Default seeded room display title.
+    pub default_room_title: String,
+    /// Default channel identifier for room queries and bridges.
+    pub default_channel_id: ChannelId,
     /// Maximum bot-to-bot reply depth before suppressing auto-triggers.
     pub max_bot_chain_depth: u8,
+    /// Bounded retention & payload limits (overflow refuses admission).
+    pub limits: RelayCapacityLimits,
 }
 
 impl Default for RelayConfig {
@@ -37,7 +88,12 @@ impl Default for RelayConfig {
             state: FeatureToggle::from_bool(cfg!(feature = "relay")),
             bind_addr: BindAddress::new(DEFAULT_RELAY_BIND),
             auth_token: None,
+            allowed_origins: Vec::new(),
+            default_room_id: RoomId::from_trusted(DEFAULT_COVE_ROOM_ID.to_string()),
+            default_room_title: DEFAULT_COVE_ROOM_TITLE.to_string(),
+            default_channel_id: ChannelId::from_trusted(DEFAULT_COVE_CHANNEL_ID.to_string()),
             max_bot_chain_depth: DEFAULT_MAX_BOT_CHAIN_DEPTH,
+            limits: RelayCapacityLimits::default(),
         }
     }
 }
@@ -80,6 +136,10 @@ pub struct TelegramBridgeConfig {
     pub session_partition: SessionPartitionName,
     /// Default Cove room id mapped to unmapped Telegram chats.
     pub default_room_id: RoomId,
+    /// Default Cove channel id mapped to unmapped Telegram chats.
+    pub default_channel_id: ChannelId,
+    /// Maximum outbound message chunk size in characters.
+    pub max_message_chars: usize,
 }
 
 impl Default for TelegramBridgeConfig {
@@ -93,7 +153,9 @@ impl Default for TelegramBridgeConfig {
             api_base_url: ServiceUrl::new("telegram.api_base_url", DEFAULT_TELEGRAM_API_BASE_URL)
                 .expect("default telegram api url is valid"),
             session_partition: SessionPartitionName::new("chat"),
-            default_room_id: RoomId::new(DEFAULT_COVE_ROOM_ID).expect("static room id is valid"),
+            default_room_id: RoomId::from_trusted(DEFAULT_COVE_ROOM_ID.to_string()),
+            default_channel_id: ChannelId::from_trusted(DEFAULT_COVE_CHANNEL_ID.to_string()),
+            max_message_chars: DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
         }
     }
 }
@@ -120,6 +182,10 @@ pub struct DiscordBridgeConfig {
     pub session_partition: SessionPartitionName,
     /// Default Cove room id mapped to unmapped Discord channels.
     pub default_room_id: RoomId,
+    /// Default Cove channel id mapped to unmapped Discord channels.
+    pub default_channel_id: ChannelId,
+    /// Maximum outbound message chunk size in characters.
+    pub max_message_chars: usize,
 }
 
 impl Default for DiscordBridgeConfig {
@@ -135,7 +201,9 @@ impl Default for DiscordBridgeConfig {
                 .expect("default discord api url is valid"),
             mention_policy: MentionPolicy::Required,
             session_partition: SessionPartitionName::new("guild_channel_user"),
-            default_room_id: RoomId::new(DEFAULT_COVE_ROOM_ID).expect("static room id is valid"),
+            default_room_id: RoomId::from_trusted(DEFAULT_COVE_ROOM_ID.to_string()),
+            default_channel_id: ChannelId::from_trusted(DEFAULT_COVE_CHANNEL_ID.to_string()),
+            max_message_chars: DEFAULT_DISCORD_MAX_MESSAGE_CHARS,
         }
     }
 }

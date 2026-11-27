@@ -19,6 +19,10 @@ test-feature-matrix:
     cargo test --no-default-features --features relay,discord
     cargo test --all-features
 
+verify-formal:
+    quint typecheck formal/cove_security.qnt
+    quint run --max-samples=2000 --max-steps=25 --invariant=AllSecurityInvariants formal/cove_security.qnt
+
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
 
@@ -34,4 +38,4 @@ plan-live:
 serve:
     cargo run -- serve
 
-check: fmt test-feature-matrix clippy
+check: fmt test-feature-matrix clippy verify-formal

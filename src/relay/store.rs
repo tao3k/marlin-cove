@@ -2,205 +2,28 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-//! Thread-safe in-memory state store for Cloud Cove rooms, invites, messages,
-//! Tier-0 governance gates, and Marlin Gateway governance envelopes.
+//! Formally verified thread-safe state store for Marlin Cove rooms, invites,
+//! messages, Tier-0 gates, replay deduplication, and bounded capacity limits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::bridges::InboundBridgeMessage;
+use crate::config::RelayCapacityLimits;
 use crate::protocol::{
     BridgeOrigin, ChannelId, GateApprovalReceipt, GateDecision, GateId, GateResolutionInput,
-    MessageAttachment, MessageId, PresenceStatus, PrincipalId, PrincipalKind, PrincipalRole,
-    ProtocolError, RoomChannel, RoomEvent, RoomEventKind, RoomGate, RoomGovernanceEnvelope, RoomId,
-    RoomInvite, RoomMessage, RoomParticipant, RoomSnapshot, ScopeId, extract_mentions,
+    InviteToken, MessageId, PresenceStatus, PrincipalId, PrincipalKind, PrincipalRole, RoomChannel,
+    RoomEvent, RoomEventKind, RoomGate, RoomGovernanceEnvelope, RoomId, RoomInvite, RoomMessage,
+    RoomParticipant, RoomSnapshot, ScopeId, extract_mentions,
 };
-
-const EVENT_BUS_CAPACITY: usize = 256;
-
-/// Errors returned by [`CoveRelayStore`] mutations and queries.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum RelayError {
-    /// Target room does not exist.
-    #[error("room `{0}` not found")]
-    RoomNotFound(RoomId),
-    /// Target channel does not exist in the room.
-    #[error("channel `{channel_id}` not found in room `{room_id}`")]
-    ChannelNotFound {
-        /// Room identifier.
-        room_id: RoomId,
-        /// Missing channel identifier.
-        channel_id: ChannelId,
-    },
-    /// Principal is not a member of the room.
-    #[error("principal `{principal_id}` is not a member of room `{room_id}`")]
-    ParticipantNotFound {
-        /// Room identifier.
-        room_id: RoomId,
-        /// Missing principal identifier.
-        principal_id: PrincipalId,
-    },
-    /// Invite token was not found or exhausted.
-    #[error("invite token `{0}` is invalid or exhausted")]
-    InvalidInvite(InviteTokenError),
-    /// Gate was not found in the target room.
-    #[error("gate `{gate_id}` not found in room `{room_id}`")]
-    GateNotFound {
-        /// Room identifier.
-        room_id: RoomId,
-        /// Missing gate identifier.
-        gate_id: GateId,
-    },
-    /// Bot reply chain exceeded configured maximum depth (anti-loop guard).
-    #[error("bot chain depth {depth} exceeds max allowed {max_depth}")]
-    BotLoopLimitExceeded {
-        /// Incoming chain depth.
-        depth: u8,
-        /// Configured ceiling.
-        max_depth: u8,
-    },
-    /// Room already exists.
-    #[error("room `{0}` already exists")]
-    RoomAlreadyExists(RoomId),
-    /// Protocol invariant or identifier validation failed.
-    #[error(transparent)]
-    Protocol(#[from] ProtocolError),
-    /// Internal lock error.
-    #[error("relay state lock poisoned")]
-    LockPoisoned,
-}
-
-/// Invite token display wrapper for [`RelayError::InvalidInvite`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InviteTokenError(pub String);
-
-impl std::fmt::Display for InviteTokenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-/// Compact summary for room listing endpoints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoomSummary {
-    /// Room identifier.
-    pub room_id: RoomId,
-    /// Room display title.
-    pub title: String,
-    /// Number of channels.
-    pub channel_count: usize,
-    /// Number of joined participants (humans + agents).
-    pub participant_count: usize,
-    /// Number of timeline messages.
-    pub message_count: usize,
-    /// Number of pending Tier-0 governance gates.
-    pub pending_gates: usize,
-}
-
-/// Request to create a new Cove room.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateRoomRequest {
-    /// Optional explicit room id; generated when omitted.
-    #[serde(default)]
-    pub room_id: Option<RoomId>,
-    /// Human-readable room title.
-    pub title: String,
-    /// Owning human principal id.
-    pub owner_id: PrincipalId,
-    /// Owning human display name.
-    pub owner_name: String,
-    /// Owning human handle.
-    pub owner_handle: String,
-}
-
-/// Request to issue a scoped invite token for a room.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateInviteRequest {
-    /// Issuing principal id (must belong to room).
-    pub issued_by: PrincipalId,
-    /// Role granted to redeeming principal.
-    pub grant_role: PrincipalRole,
-    /// Governance scopes granted upon join.
-    #[serde(default)]
-    pub grant_scopes: Vec<ScopeId>,
-    /// Maximum redemptions allowed (defaults to 1 when 0).
-    #[serde(default = "default_max_uses")]
-    pub max_uses: u32,
-}
-
-const fn default_max_uses() -> u32 {
-    1
-}
-
-/// Request to redeem an invite token and join a room.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RedeemInviteRequest {
-    /// Joining principal identifier.
-    pub principal_id: PrincipalId,
-    /// Display name.
-    pub display_name: String,
-    /// `@handle`.
-    pub handle: String,
-    /// Human vs AI agent kind.
-    pub kind: PrincipalKind,
-}
-
-/// Request to post a message to a room channel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PostMessageRequest {
-    /// Target channel id.
-    pub channel_id: ChannelId,
-    /// Optional thread root message id.
-    #[serde(default)]
-    pub thread_root_id: Option<MessageId>,
-    /// Author principal id.
-    pub author_id: PrincipalId,
-    /// Message text body.
-    pub body: String,
-    /// Optional linked Tier-0 gate id.
-    #[serde(default)]
-    pub gate_id: Option<GateId>,
-    /// Structured attachments.
-    #[serde(default)]
-    pub attachments: Vec<MessageAttachment>,
-    /// Source transport origin.
-    #[serde(default)]
-    pub origin: BridgeOrigin,
-    /// Bot chain depth (0 for human messages).
-    #[serde(default)]
-    pub bot_chain_depth: u8,
-}
-
-/// Request to open an inline Tier-0 `PromptGate` inside a channel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestGateRequest {
-    /// Target channel id.
-    pub channel_id: ChannelId,
-    /// Principal requesting execution.
-    pub requested_by: PrincipalId,
-    /// Summary shown in inline gate embed.
-    pub summary: String,
-    /// Target capability or tool name.
-    pub capability: String,
-}
-
-/// Request to resolve a Tier-0 `PromptGate` (human-only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveGateRequest {
-    /// Acting principal id (must be a `PrincipalKind::Human` room member).
-    pub actor_id: PrincipalId,
-    /// `true` to approve, `false` to deny.
-    pub approved: bool,
-    /// Rationale recorded on the receipt.
-    #[serde(default)]
-    pub reason: String,
-}
+use crate::relay::requests::{
+    CreateInviteRequest, CreateRoomRequest, InviteTokenError, PostMessageRequest,
+    RedeemInviteRequest, RelayError, RequestGateRequest, ResolveGateRequest, RoomSummary,
+};
 
 struct RoomRecord {
     id: RoomId,
@@ -210,6 +33,7 @@ struct RoomRecord {
     participants: BTreeMap<PrincipalId, RoomParticipant>,
     messages: Vec<RoomMessage>,
     gates: BTreeMap<GateId, RoomGate>,
+    seen_bridge_ids: BTreeSet<String>,
     events_tx: broadcast::Sender<RoomEvent>,
 }
 
@@ -265,35 +89,45 @@ pub struct CoveRelayStore {
     inner: Arc<RwLock<StoreInner>>,
     max_bot_chain_depth: u8,
     default_guest_scope: ScopeId,
+    limits: RelayCapacityLimits,
 }
 
 #[allow(clippy::significant_drop_tightening)]
 impl CoveRelayStore {
-    /// Construct a new store pre-seeded with the default `cove-main` workspace room.
+    /// Construct a new store pre-seeded from [`crate::config::CoveConfig`] defaults.
     #[must_use]
-    pub fn with_default_room(max_bot_chain_depth: u8, default_guest_scope: &str) -> Self {
-        let guest_scope = ScopeId::new(default_guest_scope)
+    pub fn from_config(config: &crate::config::CoveConfig) -> Self {
+        let guest_scope = ScopeId::new(&config.governance.default_guest_scope)
             .unwrap_or_else(|_| ScopeId::from_trusted("public".to_string()));
         let store = Self {
             inner: Arc::new(RwLock::new(StoreInner {
                 rooms: BTreeMap::new(),
                 invites: BTreeMap::new(),
             })),
-            max_bot_chain_depth,
+            max_bot_chain_depth: config.relay.max_bot_chain_depth,
             default_guest_scope: guest_scope,
+            limits: config.relay.limits,
         };
-        let _ = store.seed_default_cove_room();
+        let _ = store.seed_default_cove_room(
+            config.relay.default_room_id.clone(),
+            config.relay.default_room_title.clone(),
+            config.relay.default_channel_id.clone(),
+        );
         store
     }
 
-    fn seed_default_cove_room(&self) -> Result<(), RelayError> {
-        let room_id = RoomId::new("cove-main")?;
+    fn seed_default_cove_room(
+        &self,
+        room_id: RoomId,
+        room_title: String,
+        default_channel_id: ChannelId,
+    ) -> Result<(), RelayError> {
         let owner_id = PrincipalId::new("human:owner")?;
         let core_scope = ScopeId::new("org:core")?;
         let arch_scope = ScopeId::new("room:arch")?;
         let public_scope = self.default_guest_scope.clone();
 
-        let (events_tx, _) = broadcast::channel(EVENT_BUS_CAPACITY);
+        let (events_tx, _) = broadcast::channel(self.limits.event_bus_capacity.max(1));
         let mut participants = BTreeMap::new();
         participants.insert(
             owner_id.clone(),
@@ -327,38 +161,19 @@ impl CoveRelayStore {
             );
         }
 
-        let channels = vec![
-            RoomChannel {
-                id: ChannelId::new("general")?,
-                name: "general".to_string(),
-                topic: "Shared Marlin Cove collaboration channel".to_string(),
-                is_direct: false,
-            },
-            RoomChannel {
-                id: ChannelId::new("architecture")?,
-                name: "architecture".to_string(),
-                topic: "Architecture decisions & Marlin Gateway coordination".to_string(),
-                is_direct: false,
-            },
-            RoomChannel {
-                id: ChannelId::new("security")?,
-                name: "security".to_string(),
-                topic: "Tier-0 PromptGate approvals & room governance".to_string(),
-                is_direct: false,
-            },
-        ];
-
+        let channels = default_channels(default_channel_id)?;
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
         guard.rooms.insert(
             room_id.clone(),
             RoomRecord {
                 id: room_id,
-                title: "Marlin Cove Main".to_string(),
+                title: room_title,
                 latest_seq: 0,
                 channels,
                 participants,
                 messages: Vec::new(),
                 gates: BTreeMap::new(),
+                seen_bridge_ids: BTreeSet::new(),
                 events_tx,
             },
         );
@@ -375,22 +190,28 @@ impl CoveRelayStore {
         Ok(guard.rooms.values().map(RoomRecord::summary).collect())
     }
 
-    /// Create a new Cove room with default `#general`, `#architecture`, `#security` channels.
+    /// Create a new Cove room enforcing bounded room capacity.
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError::RoomAlreadyExists`] if the room id is already taken.
+    /// Returns [`RelayError::CapacityExceeded`] or [`RelayError::RoomAlreadyExists`].
     pub fn create_room(&self, request: CreateRoomRequest) -> Result<RoomSnapshot, RelayError> {
         let room_id = match request.room_id {
             Some(id) => id,
             None => RoomId::new(format!("room-{}", Uuid::new_v4().simple()))?,
         };
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
+        if guard.rooms.len() >= self.limits.max_rooms {
+            return Err(RelayError::CapacityExceeded {
+                resource: "rooms",
+                limit: self.limits.max_rooms,
+            });
+        }
         if guard.rooms.contains_key(&room_id) {
             return Err(RelayError::RoomAlreadyExists(room_id));
         }
 
-        let (events_tx, _) = broadcast::channel(EVENT_BUS_CAPACITY);
+        let (events_tx, _) = broadcast::channel(self.limits.event_bus_capacity.max(1));
         let mut participants = BTreeMap::new();
         participants.insert(
             request.owner_id.clone(),
@@ -405,35 +226,15 @@ impl CoveRelayStore {
             },
         );
 
-        let channels = vec![
-            RoomChannel {
-                id: ChannelId::new("general")?,
-                name: "general".to_string(),
-                topic: "General collaboration".to_string(),
-                is_direct: false,
-            },
-            RoomChannel {
-                id: ChannelId::new("architecture")?,
-                name: "architecture".to_string(),
-                topic: "Design & architecture".to_string(),
-                is_direct: false,
-            },
-            RoomChannel {
-                id: ChannelId::new("security")?,
-                name: "security".to_string(),
-                topic: "Governance gates".to_string(),
-                is_direct: false,
-            },
-        ];
-
         let record = RoomRecord {
             id: room_id.clone(),
             title: request.title,
             latest_seq: 0,
-            channels,
+            channels: default_channels(ChannelId::from_trusted("general".to_string()))?,
             participants,
             messages: Vec::new(),
             gates: BTreeMap::new(),
+            seen_bridge_ids: BTreeSet::new(),
             events_tx,
         };
         let snapshot = record.snapshot();
@@ -455,8 +256,33 @@ impl CoveRelayStore {
         Ok(room.snapshot())
     }
 
-    /// Build a verified [`RoomGovernanceEnvelope`] for a participant in a room,
-    /// ready to be handed off to **Marlin Gateway** (`marlin-agent-core`).
+    /// Look up an AI role agent's [`PrincipalId`] by `@handle` inside a room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayError`] if the room or matching agent is missing.
+    pub fn find_agent_by_handle(
+        &self,
+        room_id: &RoomId,
+        handle: &str,
+    ) -> Result<PrincipalId, RelayError> {
+        let normalized = handle.trim().trim_start_matches('@').to_ascii_lowercase();
+        let guard = self.inner.read().map_err(|_| RelayError::LockPoisoned)?;
+        let room = guard
+            .rooms
+            .get(room_id)
+            .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
+        room.participants
+            .values()
+            .find(|p| p.kind == PrincipalKind::Agent && p.handle == normalized)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| RelayError::ParticipantNotFound {
+                room_id: room_id.clone(),
+                principal_id: PrincipalId::from_trusted(format!("agent:{normalized}")),
+            })
+    }
+
+    /// Build a verified [`RoomGovernanceEnvelope`] for Marlin Gateway (`marlin-agent-core`).
     ///
     /// # Errors
     ///
@@ -500,34 +326,67 @@ impl CoveRelayStore {
         Ok(room.events_tx.subscribe())
     }
 
-    /// Issue a scoped invite token for a room.
+    /// Issue a scoped invite token enforcing `InvInviteAuthorizationAndNoEscalation`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the room or issuing principal does not exist.
+    /// Returns [`RelayError::UnauthorizedAction`], [`RelayError::PrivilegeEscalation`],
+    /// or [`RelayError::CapacityExceeded`].
     pub fn create_invite(
         &self,
         room_id: &RoomId,
         request: CreateInviteRequest,
     ) -> Result<RoomInvite, RelayError> {
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
+        if guard.invites.len() >= self.limits.max_invites {
+            return Err(RelayError::CapacityExceeded {
+                resource: "invites",
+                limit: self.limits.max_invites,
+            });
+        }
         let room = guard
             .rooms
             .get(room_id)
             .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
-        if !room.participants.contains_key(&request.issued_by) {
-            return Err(RelayError::ParticipantNotFound {
+        let issuer = room.participants.get(&request.issued_by).ok_or_else(|| {
+            RelayError::ParticipantNotFound {
                 room_id: room_id.clone(),
-                principal_id: request.issued_by,
+                principal_id: request.issued_by.clone(),
+            }
+        })?;
+        if !is_privileged_human(issuer) {
+            return Err(RelayError::UnauthorizedAction {
+                action: "create_invite",
+                actor_id: request.issued_by,
+            });
+        }
+        if request.grant_role == PrincipalRole::Owner {
+            return Err(RelayError::PrivilegeEscalation {
+                reason: "owner role cannot be granted via invite",
             });
         }
 
-        let token = crate::protocol::InviteToken::new(format!("inv_{}", Uuid::new_v4().simple()))?;
         let scopes = if request.grant_scopes.is_empty() {
             vec![self.default_guest_scope.clone()]
         } else {
             request.grant_scopes
         };
+        if request.grant_role == PrincipalRole::ExternalGuest
+            && scopes
+                .iter()
+                .any(|scope| scope != &self.default_guest_scope)
+        {
+            return Err(RelayError::PrivilegeEscalation {
+                reason: "external_guest invite restricted to default guest scope",
+            });
+        }
+        if scopes.iter().any(|scope| !issuer.scopes.contains(scope)) {
+            return Err(RelayError::PrivilegeEscalation {
+                reason: "issuer cannot grant scopes outside own scope set",
+            });
+        }
+
+        let token = InviteToken::new(format!("inv_{}", Uuid::new_v4().simple()))?;
         let invite = RoomInvite {
             token: token.clone(),
             room_id: room_id.clone(),
@@ -543,31 +402,54 @@ impl CoveRelayStore {
         Ok(invite)
     }
 
-    /// Redeem an invite token and admit the human or AI agent into the room.
+    /// Redeem an invite token without allowing overwrite of existing participants.
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError::InvalidInvite`] when the token is unknown or exhausted.
+    /// Returns [`RelayError::InvalidInvite`], [`RelayError::ParticipantAlreadyExists`],
+    /// or [`RelayError::PrincipalKindRoleMismatch`].
     pub fn redeem_invite(
         &self,
         token: &str,
         request: RedeemInviteRequest,
     ) -> Result<RoomParticipant, RelayError> {
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
-        let invite = guard
-            .invites
-            .get_mut(token)
-            .ok_or_else(|| RelayError::InvalidInvite(InviteTokenError(token.to_string())))?;
-        if invite.uses >= invite.max_uses {
-            return Err(RelayError::InvalidInvite(InviteTokenError(
-                token.to_string(),
-            )));
-        }
-        invite.uses = invite.uses.saturating_add(1);
-        let room_id = invite.room_id.clone();
-        let grant_role = invite.grant_role;
-        let grant_scopes = invite.grant_scopes.clone();
+        let (room_id, grant_role, grant_scopes) = {
+            let invite = guard
+                .invites
+                .get(token)
+                .ok_or_else(|| RelayError::InvalidInvite(InviteTokenError(token.to_string())))?;
+            if invite.uses >= invite.max_uses {
+                return Err(RelayError::InvalidInvite(InviteTokenError(
+                    token.to_string(),
+                )));
+            }
+            let expected_agent = invite.grant_role == PrincipalRole::RoleAgent;
+            let actual_agent = request.kind == PrincipalKind::Agent;
+            if expected_agent != actual_agent {
+                return Err(RelayError::PrincipalKindRoleMismatch);
+            }
+            (
+                invite.room_id.clone(),
+                invite.grant_role,
+                invite.grant_scopes.clone(),
+            )
+        };
 
+        let room = guard
+            .rooms
+            .get(&room_id)
+            .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
+        if room.participants.contains_key(&request.principal_id) {
+            return Err(RelayError::ParticipantAlreadyExists {
+                room_id,
+                principal_id: request.principal_id,
+            });
+        }
+
+        if let Some(invite) = guard.invites.get_mut(token) {
+            invite.uses = invite.uses.saturating_add(1);
+        }
         let room = guard
             .rooms
             .get_mut(&room_id)
@@ -589,11 +471,11 @@ impl CoveRelayStore {
         Ok(participant)
     }
 
-    /// Post a message into a Cove room channel, enforcing membership and bot-loop guards.
+    /// Post a message into a Cove room enforcing bot-loop, byte-size, and capacity bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError`] when the room/channel/author is invalid or bot depth exceeds limit.
+    /// Returns [`RelayError`] on validation, membership, loop, or capacity violation.
     pub fn post_message(
         &self,
         room_id: &RoomId,
@@ -605,12 +487,24 @@ impl CoveRelayStore {
                 max_depth: self.max_bot_chain_depth,
             });
         }
+        if request.body.len() > self.limits.max_message_bytes {
+            return Err(RelayError::MessageTooLarge {
+                actual: request.body.len(),
+                limit: self.limits.max_message_bytes,
+            });
+        }
 
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
         let room = guard
             .rooms
             .get_mut(room_id)
             .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
+        if room.messages.len() >= self.limits.max_messages_per_room {
+            return Err(RelayError::CapacityExceeded {
+                resource: "messages",
+                limit: self.limits.max_messages_per_room,
+            });
+        }
         if !room
             .channels
             .iter()
@@ -653,51 +547,30 @@ impl CoveRelayStore {
         Ok(message)
     }
 
-    /// Ingest a normalized Telegram or Discord bridge message into a Cove room.
-    ///
-    /// Bridged external senders not yet in the room are admitted with
-    /// [`PrincipalRole::ExternalGuest`] and the configured guest scope only.
+    /// Ingest a normalized Telegram or Discord bridge message with replay deduplication.
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError`] if the target room or channel does not exist.
+    /// Returns [`RelayError::DuplicateBridgeMessage`], [`RelayError::CapacityExceeded`],
+    /// or [`RelayError::MessageTooLarge`].
     pub fn ingest_bridge_message(
         &self,
         inbound: InboundBridgeMessage,
     ) -> Result<RoomMessage, RelayError> {
+        if inbound.content.len() > self.limits.max_message_bytes {
+            return Err(RelayError::MessageTooLarge {
+                actual: inbound.content.len(),
+                limit: self.limits.max_message_bytes,
+            });
+        }
+
         let mut guard = self.inner.write().map_err(|_| RelayError::LockPoisoned)?;
         let room = guard
             .rooms
             .get_mut(&inbound.target_room_id)
             .ok_or_else(|| RelayError::RoomNotFound(inbound.target_room_id.clone()))?;
-        if !room
-            .channels
-            .iter()
-            .any(|channel| channel.id == inbound.target_channel_id)
-        {
-            return Err(RelayError::ChannelNotFound {
-                room_id: inbound.target_room_id.clone(),
-                channel_id: inbound.target_channel_id,
-            });
-        }
-
-        if !room.participants.contains_key(&inbound.sender_id) {
-            let participant = RoomParticipant {
-                id: inbound.sender_id.clone(),
-                display_name: inbound.sender_name.clone(),
-                handle: inbound
-                    .sender_name
-                    .trim_start_matches('@')
-                    .to_ascii_lowercase(),
-                kind: PrincipalKind::Human,
-                role: PrincipalRole::ExternalGuest,
-                scopes: vec![self.default_guest_scope.clone()],
-                presence: PresenceStatus::Online,
-            };
-            room.participants
-                .insert(participant.id.clone(), participant.clone());
-            let _ = room.emit(RoomEventKind::ParticipantJoined { participant });
-        }
+        validate_bridge_room_admission(room, &inbound, self.limits)?;
+        ensure_bridge_guest_participant(room, &inbound, &self.default_guest_scope);
 
         let message = RoomMessage {
             id: MessageId::new(format!("msg_{}", Uuid::new_v4().simple()))?,
@@ -721,11 +594,11 @@ impl CoveRelayStore {
         Ok(message)
     }
 
-    /// Open a Tier-0 `PromptGate` inside a Cove room channel.
+    /// Open a Tier-0 `PromptGate` enforcing bounded gate capacity.
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError`] if the room, channel, or requester is missing.
+    /// Returns [`RelayError`] if capacity is exceeded or room/channel/requester is missing.
     pub fn request_gate(
         &self,
         room_id: &RoomId,
@@ -736,6 +609,12 @@ impl CoveRelayStore {
             .rooms
             .get_mut(room_id)
             .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
+        if room.gates.len() >= self.limits.max_gates_per_room {
+            return Err(RelayError::CapacityExceeded {
+                resource: "gates",
+                limit: self.limits.max_gates_per_room,
+            });
+        }
         if !room
             .channels
             .iter()
@@ -768,12 +647,13 @@ impl CoveRelayStore {
         Ok(gate)
     }
 
-    /// Resolve a Tier-0 `PromptGate`, strictly enforcing the Human-Only invariant.
+    /// Resolve a Tier-0 `PromptGate` enforcing `InvHumanOnlyTier0Gate` (human
+    /// Owner/Maintainer only, exactly-once immutable transition).
     ///
     /// # Errors
     ///
-    /// Returns [`RelayError::Protocol`] with [`ProtocolError::HumanApprovalRequired`]
-    /// if an AI agent attempts to resolve the gate.
+    /// Returns [`RelayError::UnauthorizedAction`], [`RelayError::GateAlreadyResolved`],
+    /// or [`RelayError::Protocol`].
     pub fn resolve_gate(
         &self,
         room_id: &RoomId,
@@ -785,23 +665,28 @@ impl CoveRelayStore {
             .rooms
             .get_mut(room_id)
             .ok_or_else(|| RelayError::RoomNotFound(room_id.clone()))?;
-        let actor_kind = room
-            .participants
-            .get(&request.actor_id)
-            .ok_or_else(|| RelayError::ParticipantNotFound {
+        let actor = room.participants.get(&request.actor_id).ok_or_else(|| {
+            RelayError::ParticipantNotFound {
                 room_id: room_id.clone(),
                 principal_id: request.actor_id.clone(),
-            })?
-            .kind;
+            }
+        })?;
 
         let receipt = GateApprovalReceipt::resolve_by_human(GateResolutionInput {
             gate_id: gate_id.clone(),
-            actor_id: request.actor_id,
-            actor_kind,
+            actor_id: request.actor_id.clone(),
+            actor_kind: actor.kind,
             approved: request.approved,
             reason: request.reason,
             resolved_at_unix: now_unix_secs(),
         })?;
+
+        if !is_privileged_human(actor) {
+            return Err(RelayError::UnauthorizedAction {
+                action: "resolve_gate",
+                actor_id: request.actor_id,
+            });
+        }
 
         let gate = room
             .gates
@@ -810,6 +695,11 @@ impl CoveRelayStore {
                 room_id: room_id.clone(),
                 gate_id: gate_id.clone(),
             })?;
+        if gate.decision != GateDecision::Pending {
+            return Err(RelayError::GateAlreadyResolved {
+                gate_id: gate_id.clone(),
+            });
+        }
         gate.decision = receipt.decision;
         gate.receipt = Some(receipt.clone());
 
@@ -818,6 +708,105 @@ impl CoveRelayStore {
         });
         Ok(receipt)
     }
+}
+
+fn validate_bridge_room_admission(
+    room: &mut RoomRecord,
+    inbound: &InboundBridgeMessage,
+    limits: RelayCapacityLimits,
+) -> Result<(), RelayError> {
+    if room.messages.len() >= limits.max_messages_per_room {
+        return Err(RelayError::CapacityExceeded {
+            resource: "messages",
+            limit: limits.max_messages_per_room,
+        });
+    }
+    if !room
+        .channels
+        .iter()
+        .any(|channel| channel.id == inbound.target_channel_id)
+    {
+        return Err(RelayError::ChannelNotFound {
+            room_id: inbound.target_room_id.clone(),
+            channel_id: inbound.target_channel_id.clone(),
+        });
+    }
+    let dedup_key = format!(
+        "{:?}:{}:{}",
+        inbound.origin, inbound.external_channel_id, inbound.external_message_id
+    );
+    if room.seen_bridge_ids.contains(&dedup_key) {
+        return Err(RelayError::DuplicateBridgeMessage {
+            external_message_id: inbound.external_message_id.clone(),
+        });
+    }
+    if room.seen_bridge_ids.len() >= limits.max_bridge_dedup_entries {
+        return Err(RelayError::CapacityExceeded {
+            resource: "bridge_dedup_entries",
+            limit: limits.max_bridge_dedup_entries,
+        });
+    }
+    room.seen_bridge_ids.insert(dedup_key);
+    Ok(())
+}
+
+fn ensure_bridge_guest_participant(
+    room: &mut RoomRecord,
+    inbound: &InboundBridgeMessage,
+    default_guest_scope: &ScopeId,
+) {
+    if room.participants.contains_key(&inbound.sender_id) {
+        return;
+    }
+    let participant = RoomParticipant {
+        id: inbound.sender_id.clone(),
+        display_name: inbound.sender_name.clone(),
+        handle: inbound
+            .sender_name
+            .trim_start_matches('@')
+            .to_ascii_lowercase(),
+        kind: PrincipalKind::Human,
+        role: PrincipalRole::ExternalGuest,
+        scopes: vec![default_guest_scope.clone()],
+        presence: PresenceStatus::Online,
+    };
+    room.participants
+        .insert(participant.id.clone(), participant.clone());
+    let _ = room.emit(RoomEventKind::ParticipantJoined { participant });
+}
+
+const fn is_privileged_human(participant: &RoomParticipant) -> bool {
+    matches!(participant.kind, PrincipalKind::Human)
+        && matches!(
+            participant.role,
+            PrincipalRole::Owner | PrincipalRole::Maintainer
+        )
+}
+
+fn default_channels(primary_channel: ChannelId) -> Result<Vec<RoomChannel>, RelayError> {
+    let mut channels = vec![RoomChannel {
+        name: primary_channel.as_str().to_string(),
+        id: primary_channel,
+        topic: "Shared Marlin Cove collaboration channel".to_string(),
+        is_direct: false,
+    }];
+    if channels[0].id.as_str() != "architecture" {
+        channels.push(RoomChannel {
+            id: ChannelId::new("architecture")?,
+            name: "architecture".to_string(),
+            topic: "Architecture decisions & Marlin Gateway coordination".to_string(),
+            is_direct: false,
+        });
+    }
+    if channels[0].id.as_str() != "security" {
+        channels.push(RoomChannel {
+            id: ChannelId::new("security")?,
+            name: "security".to_string(),
+            topic: "Tier-0 PromptGate approvals & room governance".to_string(),
+            is_direct: false,
+        });
+    }
+    Ok(channels)
 }
 
 fn now_unix_secs() -> u64 {

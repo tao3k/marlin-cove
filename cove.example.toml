@@ -6,7 +6,21 @@
 state = "enabled"
 bind_addr = "127.0.0.1:18090"
 # auth_token = "replace-with-cove-bearer-token"
+allowed_origins = []
+default_room_id = "cove-main"
+default_room_title = "Marlin Cove Main"
+default_channel_id = "general"
 max_bot_chain_depth = 2
+
+[relay.limits]
+event_bus_capacity = 256
+max_rooms = 64
+max_invites = 256
+max_messages_per_room = 2048
+max_gates_per_room = 256
+max_bridge_dedup_entries = 4096
+max_body_bytes = 65536
+max_message_bytes = 16384
 
 [marlin_gateway]
 base_url = "http://127.0.0.1:18093"
@@ -20,6 +34,8 @@ webhook_path = "/v1/bridges/telegram/webhook"
 api_base_url = "https://api.telegram.org"
 session_partition = "chat"
 default_room_id = "cove-main"
+default_channel_id = "general"
+max_message_chars = 4096
 
 [discord]
 state = "disabled"
@@ -31,6 +47,8 @@ api_base_url = "https://discord.com/api/v10"
 mention_policy = "required"
 session_partition = "guild_channel_user"
 default_room_id = "cove-main"
+default_channel_id = "general"
+max_message_chars = 2000
 
 [governance]
 default_guest_scope = "public"

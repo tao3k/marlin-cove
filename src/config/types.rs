@@ -23,8 +23,32 @@ pub const DEFAULT_DISCORD_API_BASE_URL: &str = "https://discord.com/api/v10";
 pub const DEFAULT_DISCORD_INGRESS_PATH: &str = "/v1/bridges/discord/ingress";
 /// Default Cove room id for bridged external chats.
 pub const DEFAULT_COVE_ROOM_ID: &str = "cove-main";
+/// Default Cove room title.
+pub const DEFAULT_COVE_ROOM_TITLE: &str = "Marlin Cove Main";
+/// Default Cove channel id for room and bridge ingress.
+pub const DEFAULT_COVE_CHANNEL_ID: &str = "general";
 /// Maximum bot-to-bot reply chain depth allowed before fail-closed suppression.
 pub const DEFAULT_MAX_BOT_CHAIN_DEPTH: u8 = 2;
+/// Default SSE broadcast channel capacity per room.
+pub const DEFAULT_EVENT_BUS_CAPACITY: usize = 256;
+/// Default maximum number of rooms retained in memory (`CapacityModel` bound).
+pub const DEFAULT_MAX_ROOMS: usize = 64;
+/// Default maximum active invite tokens retained in memory.
+pub const DEFAULT_MAX_INVITES: usize = 256;
+/// Default maximum messages retained per room.
+pub const DEFAULT_MAX_MESSAGES_PER_ROOM: usize = 2048;
+/// Default maximum Tier-0 gates retained per room.
+pub const DEFAULT_MAX_GATES_PER_ROOM: usize = 256;
+/// Default maximum external webhook ids retained per room for replay deduplication.
+pub const DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES: usize = 4096;
+/// Default maximum HTTP request payload size in bytes (64 KiB).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 65_536;
+/// Default maximum single message body size in bytes (16 KiB).
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16_384;
+/// Default Telegram outbound chunk character ceiling.
+pub const DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS: usize = 4096;
+/// Default Discord outbound chunk character ceiling.
+pub const DEFAULT_DISCORD_MAX_MESSAGE_CHARS: usize = 2000;
 
 /// Secret presence indicator safe to print in logs and CLI summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

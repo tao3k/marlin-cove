@@ -2,13 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
-//! Cloud Cove HTTP + SSE router and feature-gated bot webhooks.
+//! Cloud Cove HTTP + SSE router, hardened security boundaries, and live Marlin
+//! Gateway dispatch.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[cfg(feature = "discord")]
 use crate::bridges::discord::{
@@ -29,12 +30,15 @@ use crate::bridges::telegram::{
     TelegramSessionPartition, TelegramWebhookContext, TelegramWebhookUpdate,
     translate_webhook_update, verify_telegram_webhook_secret,
 };
-use crate::config::{CoveConfig, compiled_features};
-use crate::protocol::{BridgeOrigin, ChannelId, GateId, PrincipalId, ProtocolError, RoomId};
-use crate::relay::store::{
-    CoveRelayStore, CreateInviteRequest, CreateRoomRequest, PostMessageRequest,
-    RedeemInviteRequest, RelayError, RequestGateRequest, ResolveGateRequest,
+use crate::bridges::verify_shared_secret;
+use crate::config::{CoveConfig, SecretValue, compiled_features};
+use crate::marlin_gateway::{MarlinGatewayClient, MarlinGatewayTurnRequest};
+use crate::protocol::{BridgeOrigin, GateId, PrincipalId, ProtocolError, RoomId, SessionKey};
+use crate::relay::requests::{
+    CreateInviteRequest, CreateRoomRequest, DispatchTurnRequest, DispatchTurnResponse,
+    PostMessageRequest, RedeemInviteRequest, RelayError, RequestGateRequest, ResolveGateRequest,
 };
+use crate::relay::store::CoveRelayStore;
 
 /// Shared runtime state mounted on the Axum router.
 #[derive(Clone)]
@@ -43,19 +47,28 @@ pub struct CoveServerState {
     pub config: Arc<CoveConfig>,
     /// Thread-safe Cove room/gate/membership store.
     pub store: CoveRelayStore,
+    /// Outbound typed client targeting Marlin Gateway (`marlin-agent-core`).
+    pub marlin_gateway: Option<MarlinGatewayClient>,
 }
 
 impl CoveServerState {
     /// Build server state from a [`CoveConfig`].
     #[must_use]
     pub fn from_config(config: CoveConfig) -> Self {
-        let store = CoveRelayStore::with_default_room(
-            config.relay.max_bot_chain_depth,
-            &config.governance.default_guest_scope,
-        );
+        let store = CoveRelayStore::from_config(&config);
+        let marlin_gateway = MarlinGatewayClient::new(
+            config.marlin_gateway.base_url.as_str(),
+            config
+                .marlin_gateway
+                .bearer_token
+                .as_ref()
+                .map(|secret| secret.as_str().to_string()),
+        )
+        .ok();
         Self {
             config: Arc::new(config),
             store,
+            marlin_gateway,
         }
     }
 }
@@ -85,19 +98,21 @@ pub struct HealthResponse {
 pub enum BridgeIngressStatus {
     /// Message passed bridge policy and was posted into a Cove room.
     Ingested,
-    /// Message was intentionally ignored by bridge policy (e.g. unmentioned or bot-authored).
+    /// Message was intentionally ignored by bridge policy.
     Ignored,
+    /// Replayed external message id was deduplicated idempotently.
+    Duplicate,
 }
 
 /// Bridge webhook acknowledgement returned for Telegram/Discord ingress calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeIngressAck {
-    /// Typed outcome (`"ingested"` or `"ignored"`).
+    /// Typed outcome (`"ingested"`, `"ignored"`, or `"duplicate"`).
     pub status: BridgeIngressStatus,
     /// Cove message id when ingested into a room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
-    /// Diagnostic reason when ignored.
+    /// Diagnostic reason when ignored or deduplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -142,13 +157,21 @@ impl From<RelayError> for ApiError {
             | RelayError::GateNotFound { .. } => StatusCode::NOT_FOUND,
             RelayError::InvalidInvite(_)
             | RelayError::BotLoopLimitExceeded { .. }
+            | RelayError::PrincipalKindRoleMismatch
             | RelayError::Protocol(ProtocolError::EmptyIdentifier { .. }) => {
                 StatusCode::BAD_REQUEST
             }
-            RelayError::Protocol(ProtocolError::HumanApprovalRequired { .. }) => {
+            RelayError::MessageTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            RelayError::CapacityExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            RelayError::UnauthorizedAction { .. }
+            | RelayError::PrivilegeEscalation { .. }
+            | RelayError::Protocol(ProtocolError::HumanApprovalRequired { .. }) => {
                 StatusCode::FORBIDDEN
             }
-            RelayError::RoomAlreadyExists(_) => StatusCode::CONFLICT,
+            RelayError::RoomAlreadyExists(_)
+            | RelayError::ParticipantAlreadyExists { .. }
+            | RelayError::GateAlreadyResolved { .. }
+            | RelayError::DuplicateBridgeMessage { .. } => StatusCode::CONFLICT,
             RelayError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, error.to_string())
@@ -165,8 +188,11 @@ impl From<ProtocolError> for ApiError {
     }
 }
 
-/// Build the complete Axum router with all compiled Cargo feature routes mounted.
+/// Build the hardened Axum router with all compiled Cargo feature routes mounted.
 pub fn build_router(state: CoveServerState) -> Router {
+    let max_body_bytes = state.config.relay.limits.max_body_bytes;
+    let allowed_origins = state.config.relay.allowed_origins.clone();
+
     let mut router = Router::new()
         .route("/v1/health", get(health_handler))
         .route(
@@ -181,6 +207,7 @@ pub fn build_router(state: CoveServerState) -> Router {
         .route("/v1/rooms/{room_id}/invites", post(create_invite_handler))
         .route("/v1/invites/{token}/join", post(redeem_invite_handler))
         .route("/v1/rooms/{room_id}/messages", post(post_message_handler))
+        .route("/v1/rooms/{room_id}/dispatch", post(dispatch_turn_handler))
         .route("/v1/rooms/{room_id}/events", get(room_events_sse_handler))
         .route("/v1/rooms/{room_id}/gates", post(request_gate_handler))
         .route(
@@ -200,7 +227,22 @@ pub fn build_router(state: CoveServerState) -> Router {
         router = router.route(&ingress_path, post(discord_ingress_handler));
     }
 
-    router.layer(CorsLayer::permissive()).with_state(state)
+    let router = router
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(state);
+
+    if allowed_origins.is_empty() {
+        router
+    } else {
+        let origins: Vec<HeaderValue> = allowed_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin.trim()).ok())
+            .collect();
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST]);
+        router.layer(cors)
+    }
 }
 
 /// Bind and run the Cloud Cove Relay server until terminated.
@@ -218,23 +260,13 @@ pub async fn serve(config: CoveConfig) -> std::io::Result<()> {
 }
 
 fn check_relay_auth(config: &CoveConfig, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(expected) = config
-        .relay
-        .auth_token
-        .as_ref()
-        .map(|secret| secret.as_str().trim())
-        .filter(|token| !token.is_empty())
-    else {
-        return Ok(());
-    };
-
+    let expected = config.relay.auth_token.as_ref().map(SecretValue::as_str);
     let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|raw| raw.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(|raw| raw.strip_prefix("Bearer "));
 
-    if provided == Some(expected) {
+    if verify_shared_secret(expected, provided) {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -257,7 +289,9 @@ async fn health_handler() -> Json<HealthResponse> {
 
 async fn list_rooms_handler(
     State(state): State<CoveServerState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    check_relay_auth(&state.config, &headers)?;
     Ok(Json(state.store.list_rooms()?))
 }
 
@@ -273,19 +307,23 @@ async fn create_room_handler(
 
 async fn room_snapshot_handler(
     State(state): State<CoveServerState>,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    check_relay_auth(&state.config, &headers)?;
     let room_id = RoomId::new(room_id)?;
     Ok(Json(state.store.room_snapshot(&room_id)?))
 }
 
 async fn governance_envelope_handler(
     State(state): State<CoveServerState>,
+    headers: HeaderMap,
     Path((room_id, principal_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
+    check_relay_auth(&state.config, &headers)?;
     let room_id = RoomId::new(room_id)?;
     let principal_id = PrincipalId::new(principal_id)?;
-    let channel_id = ChannelId::new("general")?;
+    let channel_id = state.config.relay.default_channel_id.clone();
     let envelope = state.store.governance_envelope(
         &room_id,
         channel_id,
@@ -328,10 +366,92 @@ async fn post_message_handler(
     Ok((StatusCode::CREATED, Json(message)))
 }
 
+async fn dispatch_turn_handler(
+    State(state): State<CoveServerState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Json(request): Json<DispatchTurnRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_relay_auth(&state.config, &headers)?;
+    let room_id = RoomId::new(room_id)?;
+    let gateway = state.marlin_gateway.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Marlin Gateway client is not configured",
+        )
+    })?;
+    let agent_id = state
+        .store
+        .find_agent_by_handle(&room_id, &request.target_agent_handle)?;
+    let governance = state.store.governance_envelope(
+        &room_id,
+        request.channel_id.clone(),
+        &request.author_id,
+        BridgeOrigin::CoveNative,
+    )?;
+
+    let user_message = state.store.post_message(
+        &room_id,
+        PostMessageRequest {
+            channel_id: request.channel_id.clone(),
+            thread_root_id: None,
+            author_id: request.author_id.clone(),
+            body: request.body.clone(),
+            gate_id: None,
+            attachments: Vec::new(),
+            origin: BridgeOrigin::CoveNative,
+            bot_chain_depth: 0,
+        },
+    )?;
+
+    let session_key = SessionKey::new(format!(
+        "cove:{}:{}:{}",
+        room_id.as_str(),
+        request.channel_id.as_str(),
+        request.target_agent_handle.trim_start_matches('@')
+    ))?;
+    let gateway_req = MarlinGatewayTurnRequest {
+        session_id: session_key,
+        governance: governance.clone(),
+        target_agent_handle: Some(request.target_agent_handle),
+        message: request.body,
+        attachments: Vec::new(),
+    };
+    let gateway_reply = gateway
+        .dispatch_turn(&gateway_req)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error.to_string()))?;
+
+    let agent_reply = state.store.post_message(
+        &room_id,
+        PostMessageRequest {
+            channel_id: request.channel_id,
+            thread_root_id: Some(user_message.id.clone()),
+            author_id: agent_id,
+            body: gateway_reply.response,
+            gate_id: None,
+            attachments: Vec::new(),
+            origin: BridgeOrigin::MarlinGateway,
+            bot_chain_depth: 1,
+        },
+    )?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DispatchTurnResponse {
+            user_message,
+            governance,
+            agent_reply,
+        }),
+    ))
+}
+
 async fn room_events_sse_handler(
     State(state): State<CoveServerState>,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    check_relay_auth(&state.config, &headers)?;
     let room_id = RoomId::new(room_id)?;
     let rx = state.store.subscribe_room_events(&room_id)?;
     let stream = BroadcastStream::new(rx).filter_map(|item| {
@@ -376,16 +496,23 @@ async fn telegram_webhook_handler(
     headers: HeaderMap,
     Json(update): Json<TelegramWebhookUpdate>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let provided = headers
-        .get("x-telegram-bot-api-secret-token")
-        .and_then(|value| value.to_str().ok());
-    let expected = state
+    let Some(expected) = state
         .config
         .telegram
         .webhook_secret
         .as_ref()
-        .map(crate::config::SecretValue::as_str);
-    if !verify_telegram_webhook_secret(expected, provided) {
+        .map(SecretValue::as_str)
+        .filter(|secret| !secret.trim().is_empty())
+    else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "telegram webhook secret is not configured (fail-closed)",
+        ));
+    };
+    let provided = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|value| value.to_str().ok());
+    if !verify_telegram_webhook_secret(Some(expected), provided) {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid Telegram webhook secret token",
@@ -401,21 +528,11 @@ async fn telegram_webhook_handler(
             .parse::<TelegramSessionPartition>()
             .unwrap_or_default(),
         target_room_id: state.config.telegram.default_room_id.clone(),
-        target_channel_id: ChannelId::new("general")?,
+        target_channel_id: state.config.telegram.default_channel_id.clone(),
     };
 
     match translate_webhook_update(&update, context) {
-        Ok(inbound) => {
-            let message = state.store.ingest_bridge_message(inbound)?;
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(BridgeIngressAck {
-                    status: BridgeIngressStatus::Ingested,
-                    message_id: Some(message.id.to_string()),
-                    reason: None,
-                }),
-            ))
-        }
+        Ok(inbound) => ingest_bridge_to_response(&state.store, inbound),
         Err(crate::bridges::BridgeError::Ignored { reason }) => Ok((
             StatusCode::OK,
             Json(BridgeIngressAck {
@@ -434,16 +551,23 @@ async fn discord_ingress_handler(
     headers: HeaderMap,
     Json(payload): Json<DiscordIngressPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let provided = headers
-        .get("x-marlin-cove-ingress-secret")
-        .and_then(|value| value.to_str().ok());
-    let expected = state
+    let Some(expected) = state
         .config
         .discord
         .ingress_secret
         .as_ref()
-        .map(crate::config::SecretValue::as_str);
-    if !verify_discord_ingress_secret(expected, provided) {
+        .map(SecretValue::as_str)
+        .filter(|secret| !secret.trim().is_empty())
+    else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "discord ingress secret is not configured (fail-closed)",
+        ));
+    };
+    let provided = headers
+        .get("x-marlin-cove-ingress-secret")
+        .and_then(|value| value.to_str().ok());
+    if !verify_discord_ingress_secret(Some(expected), provided) {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid Discord ingress secret",
@@ -468,21 +592,11 @@ async fn discord_ingress_handler(
                 .and_then(|id| DiscordUserId::new(id.as_str()).ok()),
         },
         target_room_id: state.config.discord.default_room_id.clone(),
-        target_channel_id: ChannelId::new("general")?,
+        target_channel_id: state.config.discord.default_channel_id.clone(),
     };
 
     match translate_discord_ingress(&payload, &context) {
-        Ok(inbound) => {
-            let message = state.store.ingest_bridge_message(inbound)?;
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(BridgeIngressAck {
-                    status: BridgeIngressStatus::Ingested,
-                    message_id: Some(message.id.to_string()),
-                    reason: None,
-                }),
-            ))
-        }
+        Ok(inbound) => ingest_bridge_to_response(&state.store, inbound),
         Err(crate::bridges::BridgeError::Ignored { reason }) => Ok((
             StatusCode::OK,
             Json(BridgeIngressAck {
@@ -492,5 +606,33 @@ async fn discord_ingress_handler(
             }),
         )),
         Err(error) => Err(ApiError::new(StatusCode::BAD_REQUEST, error.to_string())),
+    }
+}
+
+#[cfg(any(feature = "telegram", feature = "discord"))]
+fn ingest_bridge_to_response(
+    store: &CoveRelayStore,
+    inbound: crate::bridges::InboundBridgeMessage,
+) -> Result<(StatusCode, Json<BridgeIngressAck>), ApiError> {
+    match store.ingest_bridge_message(inbound) {
+        Ok(message) => Ok((
+            StatusCode::ACCEPTED,
+            Json(BridgeIngressAck {
+                status: BridgeIngressStatus::Ingested,
+                message_id: Some(message.id.to_string()),
+                reason: None,
+            }),
+        )),
+        Err(RelayError::DuplicateBridgeMessage {
+            external_message_id,
+        }) => Ok((
+            StatusCode::OK,
+            Json(BridgeIngressAck {
+                status: BridgeIngressStatus::Duplicate,
+                message_id: None,
+                reason: Some(format!("duplicate external message {external_message_id}")),
+            }),
+        )),
+        Err(error) => Err(ApiError::from(error)),
     }
 }

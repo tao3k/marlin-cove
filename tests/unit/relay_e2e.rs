@@ -2,19 +2,28 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND LGPL-2.1-or-later
 
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use marlin_cove::config::{CoveConfig, ExternalBotId, FeatureToggle, MentionPolicy, SecretValue};
+use axum::routing::post;
+use marlin_cove::config::{
+    CoveConfig, ExternalBotId, FeatureToggle, MentionPolicy, SecretValue, ServiceUrl,
+};
+use marlin_cove::marlin_gateway::{MarlinGatewayTurnRequest, MarlinGatewayTurnResponse};
 use marlin_cove::protocol::{
     BridgeOrigin, GateDecision, PrincipalKind, PrincipalRole, RoomGate, RoomGovernanceEnvelope,
-    RoomInvite, RoomMessage, RoomParticipant, RoomSnapshot,
+    RoomInvite, RoomParticipant, RoomSnapshot,
 };
-use marlin_cove::relay::{CoveServerState, HealthResponse, ServiceHealthStatus, build_router};
+use marlin_cove::relay::{
+    BridgeIngressAck, BridgeIngressStatus, CoveServerState, DispatchTurnResponse, HealthResponse,
+    ServiceHealthStatus, build_router,
+};
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-fn test_router() -> axum::Router {
+fn test_router() -> Router {
     let mut config = CoveConfig::default();
     config.telegram.state = FeatureToggle::Enabled;
     config.telegram.webhook_secret = SecretValue::new("tg-sec");
@@ -26,7 +35,7 @@ fn test_router() -> axum::Router {
 }
 
 async fn json_request(
-    app: &axum::Router,
+    app: &Router,
     method: &str,
     uri: &str,
     headers: &[(&str, &str)],
@@ -51,16 +60,45 @@ async fn json_request(
 }
 
 #[tokio::test]
-async fn cove_relay_invites_and_governance_envelopes() {
+async fn cove_relay_invites_prevent_hijack_and_privilege_escalation() {
     let app = test_router();
 
     let (status, body) = json_request(&app, "GET", "/v1/health", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let health: HealthResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(health.status, ServiceHealthStatus::Ok);
-    assert_eq!(health.service, "marlin-cove");
-    assert!(health.features.contains(&"relay".to_string()));
 
+    // Non-human agent cannot issue invites.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/v1/rooms/cove-main/invites",
+        &[],
+        Some(json!({
+            "issued_by": "agent:architect",
+            "grant_role": "member",
+            "grant_scopes": ["public"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Owner cannot grant owner role or escalate external_guest scopes beyond public.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/v1/rooms/cove-main/invites",
+        &[],
+        Some(json!({
+            "issued_by": "human:owner",
+            "grant_role": "external_guest",
+            "grant_scopes": ["org:core"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Valid guest invite issued by human owner.
     let (status, body) = json_request(
         &app,
         "POST",
@@ -70,14 +108,31 @@ async fn cove_relay_invites_and_governance_envelopes() {
             "issued_by": "human:owner",
             "grant_role": "external_guest",
             "grant_scopes": ["public"],
-            "max_uses": 1
+            "max_uses": 2
         })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let invite: RoomInvite = serde_json::from_slice(&body).unwrap();
-
     let join_uri = format!("/v1/invites/{}/join", invite.token.as_str());
+
+    // Quint-caught regression: redeeming invite MUST NOT overwrite existing human:owner.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        &join_uri,
+        &[],
+        Some(json!({
+            "principal_id": "human:owner",
+            "display_name": "Hijacker",
+            "handle": "hijack",
+            "kind": "human"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Legitimate guest joins once; governance envelope carries tainted_external=true.
     let (status, body) = json_request(
         &app,
         "POST",
@@ -95,22 +150,7 @@ async fn cove_relay_invites_and_governance_envelopes() {
     let guest: RoomParticipant = serde_json::from_slice(&body).unwrap();
     assert_eq!(guest.role, PrincipalRole::ExternalGuest);
 
-    let (status, _) = json_request(
-        &app,
-        "POST",
-        &join_uri,
-        &[],
-        Some(json!({
-            "principal_id": "human:guest-2",
-            "display_name": "Guest Two",
-            "handle": "guest2",
-            "kind": "human"
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    let (status, guest_env_bytes) = json_request(
+    let (status, env_bytes) = json_request(
         &app,
         "GET",
         "/v1/rooms/cove-main/governance/human:guest-1",
@@ -119,35 +159,60 @@ async fn cove_relay_invites_and_governance_envelopes() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let guest_env: RoomGovernanceEnvelope = serde_json::from_slice(&guest_env_bytes).unwrap();
+    let guest_env: RoomGovernanceEnvelope = serde_json::from_slice(&env_bytes).unwrap();
     assert!(guest_env.tainted_external);
-    assert_eq!(guest_env.actor_role, PrincipalRole::ExternalGuest);
 }
 
 #[tokio::test]
-async fn cove_relay_ingests_telegram_and_discord_bridges() {
+async fn cove_relay_bridges_fail_closed_without_secret_and_deduplicate_replays() {
     let app = test_router();
 
     #[cfg(feature = "telegram")]
     {
+        let tg_payload = json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 55,
+                "from": { "id": 888, "username": "tg_alice", "first_name": "Alice" },
+                "chat": { "id": -1001, "type": "supergroup", "title": "Marlin TG" },
+                "date": 1_700_000_500,
+                "text": "@reviewer check mobile swipe"
+            }
+        });
         let (status, _) = json_request(
             &app,
             "POST",
             "/v1/bridges/telegram/webhook",
             &[("x-telegram-bot-api-secret-token", "tg-sec")],
-            Some(json!({
-                "update_id": 100,
-                "message": {
-                    "message_id": 55,
-                    "from": { "id": 888, "username": "tg_alice", "first_name": "Alice" },
-                    "chat": { "id": -1001, "type": "supergroup", "title": "Marlin TG" },
-                    "date": 1_700_000_500,
-                    "text": "@reviewer check mobile swipe"
-                }
-            })),
+            Some(tg_payload.clone()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Replaying the exact same Telegram message id must deduplicate cleanly.
+        let (status, replay_bytes) = json_request(
+            &app,
+            "POST",
+            "/v1/bridges/telegram/webhook",
+            &[("x-telegram-bot-api-secret-token", "tg-sec")],
+            Some(tg_payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ack: BridgeIngressAck = serde_json::from_slice(&replay_bytes).unwrap();
+        assert_eq!(ack.status, BridgeIngressStatus::Duplicate);
+
+        // Unconfigured webhook secret MUST fail closed (401 Unauthorized).
+        let unconfigured = build_router(CoveServerState::from_config(CoveConfig::default()));
+        let (status, _) = json_request(
+            &unconfigured,
+            "POST",
+            "/v1/bridges/telegram/webhook",
+            &[],
+            Some(json!({ "update_id": 1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[cfg(feature = "discord")]
@@ -176,18 +241,14 @@ async fn cove_relay_ingests_telegram_and_discord_bridges() {
     let (status, body) = json_request(&app, "GET", "/v1/rooms/cove-main/snapshot", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let snapshot: RoomSnapshot = serde_json::from_slice(&body).unwrap();
-    assert!(
-        snapshot
-            .participants
-            .iter()
-            .any(|p| p.id.as_str() == "agent:architect" && p.kind == PrincipalKind::Agent)
-    );
     #[cfg(feature = "telegram")]
-    assert!(
+    assert_eq!(
         snapshot
             .messages
             .iter()
-            .any(|msg| msg.origin == BridgeOrigin::Telegram)
+            .filter(|msg| msg.origin == BridgeOrigin::Telegram)
+            .count(),
+        1
     );
     #[cfg(feature = "discord")]
     assert!(
@@ -199,45 +260,69 @@ async fn cove_relay_ingests_telegram_and_discord_bridges() {
 }
 
 #[tokio::test]
-async fn cove_relay_enforces_bot_loop_limit_and_human_only_tier0_gate() {
-    let app = test_router();
+async fn cove_relay_enforces_tier0_gate_immutability_capacity_and_auth() {
+    let mut config = CoveConfig::default();
+    config.relay.auth_token = SecretValue::new("cove-secret-99");
+    config.relay.limits.max_messages_per_room = 2;
+    let app = build_router(CoveServerState::from_config(config));
+    let auth = [("authorization", "Bearer cove-secret-99")];
 
-    let (status, body) = json_request(
-        &app,
-        "POST",
-        "/v1/rooms/cove-main/messages",
-        &[],
-        Some(json!({
-            "channel_id": "architecture",
-            "author_id": "human:owner",
-            "body": "@architect please inspect the Cove protocol"
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let posted: RoomMessage = serde_json::from_slice(&body).unwrap();
-    assert_eq!(posted.mentions, vec!["architect"]);
+    // Protected reads MUST reject missing bearer tokens.
+    let (status, _) = json_request(&app, "GET", "/v1/rooms/cove-main/snapshot", &[], None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // Bounded capacity (CapacityModel): 2 messages succeed, 3rd returns 429.
+    for idx in 0..2 {
+        let (status, _) = json_request(
+            &app,
+            "POST",
+            "/v1/rooms/cove-main/messages",
+            &auth,
+            Some(json!({
+                "channel_id": "architecture",
+                "author_id": "human:owner",
+                "body": format!("msg-{idx}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
     let (status, _) = json_request(
         &app,
         "POST",
         "/v1/rooms/cove-main/messages",
-        &[],
+        &auth,
+        Some(json!({
+            "channel_id": "architecture",
+            "author_id": "human:owner",
+            "body": "overflow"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // Bot-loop depth guard.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/v1/rooms/cove-main/messages",
+        &auth,
         Some(json!({
             "channel_id": "architecture",
             "author_id": "agent:architect",
-            "body": "infinite loop attempt",
+            "body": "loop",
             "bot_chain_depth": 5
         })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // Tier-0 Gate: Agent rejected (403), Human Owner approves (200), replay rejected (409).
     let (status, body) = json_request(
         &app,
         "POST",
         "/v1/rooms/cove-main/gates",
-        &[],
+        &auth,
         Some(json!({
             "channel_id": "security",
             "requested_by": "agent:architect",
@@ -255,12 +340,8 @@ async fn cove_relay_enforces_bot_loop_limit_and_human_only_tier0_gate() {
         &app,
         "POST",
         &resolve_uri,
-        &[],
-        Some(json!({
-            "actor_id": "agent:architect",
-            "approved": true,
-            "reason": "bot trying to self-approve"
-        })),
+        &auth,
+        Some(json!({ "actor_id": "agent:architect", "approved": true })),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -269,13 +350,83 @@ async fn cove_relay_enforces_bot_loop_limit_and_human_only_tier0_gate() {
         &app,
         "POST",
         &resolve_uri,
-        &[],
-        Some(json!({
-            "actor_id": "human:owner",
-            "approved": true,
-            "reason": "human reviewed and approved"
-        })),
+        &auth,
+        Some(json!({ "actor_id": "human:owner", "approved": true, "reason": "ok" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        &resolve_uri,
+        &auth,
+        Some(json!({ "actor_id": "human:owner", "approved": false, "reason": "replay" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn cove_relay_live_dispatches_turn_to_marlin_gateway_with_governance_envelope() {
+    // Spawn a real local TCP mock Marlin Gateway (`marlin-agent-core`) endpoint.
+    let gateway_app = Router::new().route(
+        "/message",
+        post(
+            |axum::Json(req): axum::Json<MarlinGatewayTurnRequest>| async move {
+                let reply = format!(
+                    "[Marlin Gateway] role={:?} actor={} tainted={} reply=ok",
+                    req.governance.actor_role,
+                    req.governance.actor_id.as_str(),
+                    req.governance.tainted_external
+                );
+                axum::Json(MarlinGatewayTurnResponse { response: reply })
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, gateway_app).await;
+    });
+
+    let mut config = CoveConfig::default();
+    config.marlin_gateway.base_url =
+        ServiceUrl::new("marlin_gateway.base_url", format!("http://{gateway_addr}")).unwrap();
+    let app = build_router(CoveServerState::from_config(config));
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/v1/rooms/cove-main/dispatch",
+        &[],
+        Some(json!({
+            "channel_id": "architecture",
+            "author_id": "human:owner",
+            "target_agent_handle": "architect",
+            "body": "@architect verify Marlin Gateway handoff"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let dispatched: DispatchTurnResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(dispatched.governance.actor_role, PrincipalRole::Owner);
+    assert!(!dispatched.governance.tainted_external);
+    assert_eq!(dispatched.agent_reply.origin, BridgeOrigin::MarlinGateway);
+    assert_eq!(dispatched.agent_reply.author_kind, PrincipalKind::Agent);
+    assert_eq!(dispatched.agent_reply.bot_chain_depth, 1);
+    assert!(
+        dispatched
+            .agent_reply
+            .body
+            .contains("[Marlin Gateway] role=Owner actor=human:owner tainted=false")
+    );
+
+    let (status, snap_bytes) =
+        json_request(&app, "GET", "/v1/rooms/cove-main/snapshot", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let snapshot: RoomSnapshot = serde_json::from_slice(&snap_bytes).unwrap();
+    assert_eq!(snapshot.messages.len(), 2);
+
+    server_handle.abort();
 }

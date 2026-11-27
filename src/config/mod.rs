@@ -12,17 +12,21 @@ pub mod preflight;
 pub mod types;
 
 pub use model::{
-    CoveConfig, DiscordBridgeConfig, GovernanceConfig, MarlinGatewayConfig, RelayConfig,
-    TelegramBridgeConfig,
+    CoveConfig, DiscordBridgeConfig, GovernanceConfig, MarlinGatewayConfig, RelayCapacityLimits,
+    RelayConfig, TelegramBridgeConfig,
 };
 pub use preflight::{
     CoveConfigSummary, LaunchPlan, PlannedSurface, PreflightIssue, PreflightReport,
     PreflightStatus, compiled_features,
 };
 pub use types::{
-    BindAddress, CoveConfigError, DEFAULT_COVE_ROOM_ID, DEFAULT_DISCORD_API_BASE_URL,
-    DEFAULT_DISCORD_INGRESS_PATH, DEFAULT_MARLIN_GATEWAY_URL, DEFAULT_MAX_BOT_CHAIN_DEPTH,
-    DEFAULT_RELAY_BIND, DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_WEBHOOK_PATH,
-    ExternalBotId, FeatureToggle, MentionPolicy, RoutePath, SecretState, SecretValue, ServiceUrl,
-    SessionPartitionName,
+    BindAddress, CoveConfigError, DEFAULT_COVE_CHANNEL_ID, DEFAULT_COVE_ROOM_ID,
+    DEFAULT_COVE_ROOM_TITLE, DEFAULT_DISCORD_API_BASE_URL, DEFAULT_DISCORD_INGRESS_PATH,
+    DEFAULT_DISCORD_MAX_MESSAGE_CHARS, DEFAULT_EVENT_BUS_CAPACITY, DEFAULT_MARLIN_GATEWAY_URL,
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_BOT_CHAIN_DEPTH, DEFAULT_MAX_BRIDGE_DEDUP_ENTRIES,
+    DEFAULT_MAX_GATES_PER_ROOM, DEFAULT_MAX_INVITES, DEFAULT_MAX_MESSAGE_BYTES,
+    DEFAULT_MAX_MESSAGES_PER_ROOM, DEFAULT_MAX_ROOMS, DEFAULT_RELAY_BIND,
+    DEFAULT_TELEGRAM_API_BASE_URL, DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
+    DEFAULT_TELEGRAM_WEBHOOK_PATH, ExternalBotId, FeatureToggle, MentionPolicy, RoutePath,
+    SecretState, SecretValue, ServiceUrl, SessionPartitionName,
 };
